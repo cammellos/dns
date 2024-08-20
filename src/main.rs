@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::net::ToSocketAddrs;
 
 
 const MAX_DNS_PACKET_SIZE : usize = 512;
@@ -49,14 +48,12 @@ fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> &[u8] {
     let mut i = 12;
 
     while i < buf.len() {
-        let label_len = buf[i] as usize;
-
-        if label_len == 0 {
+        if buf[i] == 0 {
             // exclude null terminator
             return &buf[12..=i-1];
         }
 
-        i += 1 + label_len;
+        i += 1;
     }
 
     &[]
@@ -66,13 +63,37 @@ fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> &[u8] {
 mod tests {
 
     use super::*;
+
     #[test]
-    fn test_extract_dns_payload() {
-        let payload = extract_dns_payload(&query);
-        assert_eq!(qname[0..15], *payload);
+    fn test_extract_dns_payload_happy_path() {
+        let payload = extract_dns_payload(&TEST_QUERY);
+        assert_eq!(QNAME[0..15], *payload);
     }
 
-    const query: [u8; MAX_DNS_PACKET_SIZE] = [
+    #[test]
+    fn test_extract_dns_payload_empty_buffer() {
+        let empty_buffer: [u8; MAX_DNS_PACKET_SIZE] = [0; MAX_DNS_PACKET_SIZE];
+        let payload = extract_dns_payload(&empty_buffer);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_extract_dns_payload_no_null_terminator() {
+        let no_null_buffer: [u8; MAX_DNS_PACKET_SIZE] = [1; MAX_DNS_PACKET_SIZE];
+        let payload = extract_dns_payload(&no_null_buffer);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_extract_dns_payload_too_large_size() {
+        let mut no_null_buffer: [u8; MAX_DNS_PACKET_SIZE] = [1; MAX_DNS_PACKET_SIZE];
+        no_null_buffer[no_null_buffer.len() - 1] = 0;
+        let payload = extract_dns_payload(&no_null_buffer);
+        assert!(payload.is_empty());
+    }
+
+
+    const TEST_QUERY: [u8; MAX_DNS_PACKET_SIZE] = [
         0x12, 0x34,             // ID
         0x01, 0x00,             // Flags (standard query with recursion)
         0x00, 0x01,             // Questions: 1
@@ -134,7 +155,7 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    const qname: [u8; 16] = [
+    const QNAME: [u8; 16] = [
         0x03, 0x77, 0x77, 0x77, // QNAME: "www"
         0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, // "google"
         0x03, 0x63, 0x6f, 0x6d, // "com"
