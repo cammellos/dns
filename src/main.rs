@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Build the DNS query packet
     let query = build_dns_query(&["www.google.co.uk", "www.guardian.co.uk"]);
 
+    extract_dns_payload(&query);
     // Bind a UDP socket to a local address
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
