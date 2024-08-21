@@ -3,6 +3,7 @@ use std::error::Error;
 
 const MAX_DNS_PACKET_SIZE : usize = 512;
 const MAX_DNS_QNAME_SIZE : usize = 255;
+const DNS_HEADER_SIZE : usize = 12;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -45,9 +46,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> &[u8] {
-    let mut i = 12;
+    let mut i = DNS_HEADER_SIZE;
 
-    while i < buf.len() {
+    while i < buf.len() && i < DNS_HEADER_SIZE + MAX_DNS_QNAME_SIZE {
         if buf[i] == 0 {
             // exclude null terminator
             return &buf[12..=i-1];
@@ -86,9 +87,9 @@ mod tests {
 
     #[test]
     fn test_extract_dns_payload_too_large_size() {
-        let mut no_null_buffer: [u8; MAX_DNS_PACKET_SIZE] = [1; MAX_DNS_PACKET_SIZE];
-        no_null_buffer[no_null_buffer.len() - 1] = 0;
-        let payload = extract_dns_payload(&no_null_buffer);
+        let mut too_large_buffer: [u8; MAX_DNS_PACKET_SIZE] = [1; MAX_DNS_PACKET_SIZE];
+        too_large_buffer[too_large_buffer.len() - 1] = 0;
+        let payload = extract_dns_payload(&too_large_buffer);
         assert!(payload.is_empty());
     }
 
