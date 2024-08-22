@@ -1,7 +1,25 @@
 use crate::constants::{
-    DNS_HEADER_SIZE, DNS_TYPE_CLASS_SIZE, MAX_DNS_FIRST_QNAME_SIZE, MAX_DNS_PACKET_SIZE,
-    MAX_DNS_SECOND_QNAME_SIZE,
+    AddressType, DNS_HEADER_SIZE, DNS_TYPE_CLASS_SIZE, MAX_DNS_FIRST_QNAME_SIZE,
+    MAX_DNS_PACKET_SIZE, MAX_DNS_SECOND_QNAME_SIZE, NETWORK_ADDRESS_TYPE_DOMAIN_NAME,
+    NETWORK_ADDRESS_TYPE_IPV4, NETWORK_ADDRESS_TYPE_IPV6,
 };
+
+#[derive(Debug)]
+pub enum ExtractStartConnectionHeaderError {
+    InvalidAddressType(u8),
+}
+
+impl std::fmt::Display for ExtractStartConnectionHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ExtractStartConnectionHeaderError::InvalidAddressType(at) => {
+                write!(f, "Invalid address type: {}", at)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExtractStartConnectionHeaderError {}
 
 pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Vec<u8> {
     let number_of_questions = usize::from(buf[5]);
@@ -46,6 +64,32 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Vec<u8> {
     result.extend_from_slice(question_1_data);
     result.extend_from_slice(&buf[question_2_data_start..question_2_data_end]);
     result
+}
+
+#[derive(Debug)]
+pub struct ConnectionHeader {
+    address_type: AddressType,
+}
+
+pub fn extract_start_connection_header(
+    buf: Vec<u8>,
+) -> Result<ConnectionHeader, ExtractStartConnectionHeaderError> {
+    let address_type: AddressType;
+
+    match buf[0] {
+        NETWORK_ADDRESS_TYPE_IPV4 => address_type = AddressType::IPV4,
+        NETWORK_ADDRESS_TYPE_IPV6 => address_type = AddressType::IPV6,
+        NETWORK_ADDRESS_TYPE_DOMAIN_NAME => address_type = AddressType::DomainName,
+        _ => {
+            return Err(ExtractStartConnectionHeaderError::InvalidAddressType(
+                buf[0],
+            ))
+        }
+    }
+
+    Ok(ConnectionHeader {
+        address_type,
+    })
 }
 
 #[cfg(test)]
@@ -139,5 +183,35 @@ mod tests {
         let payload = extract_dns_payload(&query);
 
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_extract_connection_header_ipv4() {
+        let input = vec![NETWORK_ADDRESS_TYPE_IPV4];
+        let result = extract_start_connection_header(input).unwrap();
+        assert_eq!(AddressType::IPV4, result.address_type);
+    }
+
+    #[test]
+    fn test_extract_connection_header_ipv6() {
+        let input = vec![NETWORK_ADDRESS_TYPE_IPV6];
+        let result = extract_start_connection_header(input).unwrap();
+        assert_eq!(AddressType::IPV6, result.address_type);
+    }
+
+    #[test]
+    fn test_extract_connection_header_domain_name() {
+        let input = vec![NETWORK_ADDRESS_TYPE_DOMAIN_NAME];
+        let result = extract_start_connection_header(input).unwrap();
+        assert_eq!(AddressType::DomainName, result.address_type);
+    }
+
+    #[test]
+    fn test_extract_connection_header_unknown_type() {
+        let input = vec![0x04];
+        let result = extract_start_connection_header(input);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "Invalid address type: 4");
     }
 }
