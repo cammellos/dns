@@ -9,13 +9,6 @@ pub const MAX_DNS_SECOND_QNAME_SIZE: usize = MAX_DNS_PACKET_SIZE
     - 2 * DNS_TYPE_CLASS_SIZE
     - 2 * DNS_QNAME_METADATA_SIZE;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum AddressType {
-    IPV4,
-    IPV6,
-    DomainName,
-}
-
 pub const NETWORK_ADDRESS_TYPE_IPV4: u8 = 0x01;
 pub const NETWORK_ADDRESS_TYPE_IPV6: u8 = 0x02;
 pub const NETWORK_ADDRESS_TYPE_DOMAIN_NAME: u8 = 0x03;
