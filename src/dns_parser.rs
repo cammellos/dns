@@ -95,40 +95,32 @@ fn extract_start_connection_header_ipv4(buf: Vec<u8>) -> ConnectionInfo {
     }
 }
 
-pub fn extract_start_connection_header(
-    buf: Vec<u8>,
-) -> Result<ConnectionHeader, ExtractStartConnectionHeaderError> {
-    if buf.is_empty() {
-        return Err(ExtractStartConnectionHeaderError::InvalidConnectionHeader);
-    }
-
-    match buf[0] {
-        NETWORK_ADDRESS_TYPE_IPV4 => {
-            Ok(ConnectionHeader {
-                info: extract_start_connection_header_ipv4(buf),
-            })
+impl ConnectionHeader {
+    pub fn new(buf: Vec<u8>) -> Result<ConnectionHeader, ExtractStartConnectionHeaderError> {
+        if buf.is_empty() {
+            return Err(ExtractStartConnectionHeaderError::InvalidConnectionHeader);
         }
-        NETWORK_ADDRESS_TYPE_IPV6 => {
-            Ok(ConnectionHeader {
+
+        match buf[0] {
+            NETWORK_ADDRESS_TYPE_IPV4 => Ok(ConnectionHeader {
+                info: extract_start_connection_header_ipv4(buf),
+            }),
+            NETWORK_ADDRESS_TYPE_IPV6 => Ok(ConnectionHeader {
                 info: ConnectionInfo::Ipv6 {
                     address: [192, 168, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                     port: 8080,
                 },
-            })
-        }
+            }),
 
-        NETWORK_ADDRESS_TYPE_DOMAIN_NAME => {
-            Ok(ConnectionHeader {
+            NETWORK_ADDRESS_TYPE_DOMAIN_NAME => Ok(ConnectionHeader {
                 info: ConnectionInfo::DomainName {
                     name: String::from("test"),
                     port: 8080,
                 },
-            })
-        }
-        _ => {
-            Err(ExtractStartConnectionHeaderError::InvalidAddressType(
+            }),
+            _ => Err(ExtractStartConnectionHeaderError::InvalidAddressType(
                 buf[0],
-            ))
+            )),
         }
     }
 }
@@ -229,7 +221,7 @@ mod tests {
     #[test]
     fn test_extract_connection_header_empty() {
         let input = vec![];
-        let result = extract_start_connection_header(input);
+        let result = ConnectionHeader::new(input);
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "invalid connection header");
@@ -238,7 +230,7 @@ mod tests {
     #[test]
     fn test_extract_connection_header_ipv4() {
         let input = vec![NETWORK_ADDRESS_TYPE_IPV4, 192, 168, 1, 254, 0, 80];
-        let result = extract_start_connection_header(input).unwrap();
+        let result = ConnectionHeader::new(input).unwrap();
         match result.info {
             ConnectionInfo::Ipv4 { address, port } => {
                 assert_eq!(address, Ipv4Addr::new(192, 168, 1, 254));
@@ -253,7 +245,7 @@ mod tests {
     #[test]
     fn test_extract_connection_header_ipv6() {
         let input = vec![NETWORK_ADDRESS_TYPE_IPV6];
-        let result = extract_start_connection_header(input).unwrap();
+        let result = ConnectionHeader::new(input).unwrap();
         panic!("wrong type, expected ipv6")
     }
 
@@ -277,7 +269,7 @@ mod tests {
             0,
             80,
         ];
-        let result = extract_start_connection_header(input).unwrap();
+        let result = ConnectionHeader::new(input).unwrap();
         match result.info {
             ConnectionInfo::DomainName { name, port } => {
                 assert_eq!(name, "example.com");
@@ -290,7 +282,7 @@ mod tests {
     #[test]
     fn test_extract_connection_header_unknown_type() {
         let input = vec![0x04];
-        let result = extract_start_connection_header(input);
+        let result = ConnectionHeader::new(input);
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "invalid address type: 4");

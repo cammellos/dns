@@ -1,5 +1,6 @@
 mod constants;
 mod dns_parser;
+mod udp_server;
 mod utils;
 
 #[tokio::main]
@@ -10,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = utils::build_dns_query(&["www.google.co.uk", "www.guardian.co.uk"]);
 
     let payload = dns_parser::extract_dns_payload(&query);
-    let _ = dns_parser::extract_start_connection_header(payload);
+    let _ = dns_parser::ConnectionHeader::new(payload);
     // Bind a UDP socket to a local address
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
