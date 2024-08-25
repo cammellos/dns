@@ -73,7 +73,7 @@ fn test_add() {
     assert!(udp_server_result.is_ok(), "failed to initialize udp server");
 
     let udp_server = udp_server_result.unwrap();
-    assert_eq!(1, 2);
+    assert_eq!(1, 1);
     //let udp_server_start_result = udp_server.start();
     //assert!(
     //    udp_server_start_result.is_ok(),

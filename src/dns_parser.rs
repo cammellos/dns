@@ -71,16 +71,45 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Vec<u8> {
     result
 }
 
-#[derive(Debug)]
-enum ConnectionInfo {
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectionInfo {
     Ipv4 { address: Ipv4Addr, port: u16 },
     Ipv6 { address: [u8; 16], port: u16 },
     DomainName { name: String, port: u16 },
 }
 
+impl ConnectionInfo {
+    pub fn to_network(&self) -> Vec<u8> {
+        return vec![];
+    }
+}
+
+/// The initial information exchanged with the dns server.
+///
+/// It includes whether we are requesting an ipv4, ipv6 or a connection to a domain name
+///
+/// # Examples
+///
+/// ```
+/// use dns::dns_parser::ConnectionInfo;
+/// use dns::dns_parser::ConnectionHeader;
+/// use std::net::Ipv4Addr;
+///
+/// let connection_info = ConnectionInfo::Ipv4 {
+///     address: Ipv4Addr::new(192, 168, 0, 1),
+///     port: 8080,
+/// };
+///
+///
+/// let connection_header = ConnectionHeader::new(connection_info.to_network());
+/// assert!(connection_header.is_ok());
+///
+/// assert_eq!(connection_header.unwrap().info, connection_info);
+/// ```
+///
 #[derive(Debug)]
 pub struct ConnectionHeader {
-    info: ConnectionInfo,
+    pub info: ConnectionInfo,
 }
 
 fn extract_port_from_u8s(high_byte: u8, low_byte: u8) -> u16 {
