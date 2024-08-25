@@ -4,6 +4,7 @@ use crate::constants::{
     NETWORK_ADDRESS_TYPE_IPV6,
 };
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 #[derive(Debug)]
 pub enum ExtractStartConnectionHeaderError {
@@ -74,7 +75,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Vec<u8> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnectionInfo {
     Ipv4 { address: Ipv4Addr, port: u16 },
-    Ipv6 { address: [u8; 16], port: u16 },
+    Ipv6 { address: Ipv6Addr, port: u16 },
     DomainName { name: String, port: u16 },
 }
 
@@ -87,7 +88,7 @@ impl ConnectionInfo {
         match buf[0] {
             NETWORK_ADDRESS_TYPE_IPV4 => Ok(extract_start_connection_header_ipv4(buf)),
             NETWORK_ADDRESS_TYPE_IPV6 => Ok(ConnectionInfo::Ipv6 {
-                address: [192, 168, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                address: Ipv6Addr::new(0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0),
                 port: 8080,
             }),
 
@@ -102,7 +103,24 @@ impl ConnectionInfo {
     }
 
     pub fn to_network(&self) -> Vec<u8> {
-        return vec![];
+        match self {
+            ConnectionInfo::Ipv4 { address, port } => {
+                let octets = address.octets();
+                let port_bytes = port.to_be_bytes();
+                vec![
+                    NETWORK_ADDRESS_TYPE_IPV4,
+                    octets[0],
+                    octets[1],
+                    octets[2],
+                    octets[3],
+                    port_bytes[0],
+                    port_bytes[1],
+                ]
+            }
+            _ => {
+                vec![]
+            }
+        }
     }
 }
 
@@ -318,5 +336,60 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "invalid address type: 4");
+    }
+
+    #[test]
+    fn test_connection_info_to_network_ipv4() {
+        let connection_info = ConnectionInfo::Ipv4 {
+            address: Ipv4Addr::new(0xa, 0xb, 0xc, 0xd),
+            port: 0x1f90,
+        };
+
+        let result = connection_info.to_network();
+
+        assert_eq!(
+            vec![NETWORK_ADDRESS_TYPE_IPV4, 0xa, 0xb, 0xc, 0xd, 0x1f, 0x90],
+            result
+        );
+    }
+
+    #[ignore]
+    #[test]
+    fn test_connection_info_to_network_ipv6() {
+        let connection_info = ConnectionInfo::Ipv6 {
+            address: Ipv6Addr::new(0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8),
+            port: 0x1f90,
+        };
+
+        let result = connection_info.to_network();
+
+        assert_eq!(
+            vec![NETWORK_ADDRESS_TYPE_IPV4, 0xa, 0xb, 0xc, 0xd, 0x1f, 0x90],
+            result
+        );
+    }
+
+    #[ignore]
+    #[test]
+    fn test_connection_info_to_network_domain_name() {
+        let connection_info = ConnectionInfo::DomainName {
+            name: String::from("www.movimenta.com"),
+            port: 0x1f90,
+        };
+
+        let result = connection_info.to_network();
+
+        assert_eq!(
+            vec![
+                NETWORK_ADDRESS_TYPE_DOMAIN_NAME,
+                0xa,
+                0xb,
+                0xc,
+                0xd,
+                0x1f,
+                0x90
+            ],
+            result
+        );
     }
 }

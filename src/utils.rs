@@ -13,9 +13,10 @@ fn domain_to_qname(domain: &str, buffer: &mut [u8], offset: &mut usize) {
 }
 
 pub fn wrap_data_in_dns_queries(data: Vec<u8>) -> [u8; MAX_DNS_PACKET_SIZE] {
-    let mut buffer = [0u8; MAX_DNS_PACKET_SIZE];
-    buffer
+    
+    [0u8; MAX_DNS_PACKET_SIZE]
 }
+
 pub fn build_dns_query(domains: &[&str]) -> [u8; MAX_DNS_PACKET_SIZE] {
     let mut buffer = [0u8; MAX_DNS_PACKET_SIZE];
     let mut offset = 0;
