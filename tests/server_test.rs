@@ -4,10 +4,14 @@
 // Wait for udp data
 //
 //
+use dns::dns_parser::{extract_dns_payload, ConnectionInfo};
+use dns::network_packet::ConnectCommand;
 use dns::udp_server::UdpServer;
 use std::io::{Result, Write};
+use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
 
 fn handle_client(mut stream: TcpStream) -> Result<()> {
     let response = b"Hello, this is the server!";
@@ -31,6 +35,7 @@ fn start_tcp_test_server() -> Result<(TcpListener, SocketAddr)> {
                 Ok(stream) => {
                     // Handle the client in a separate thread
                     thread::spawn(|| {
+                        println!("HANDLING CLIENT");
                         handle_client(stream).unwrap();
                     });
                 }
@@ -62,21 +67,40 @@ fn start_tcp_test_server() -> Result<(TcpListener, SocketAddr)> {
 
 // Ok(())
 //}
-#[test]
-fn test_add() {
+#[tokio::test]
+async fn test_add() {
+    // Start the TCP test server
     let tcp_server_result = start_tcp_test_server();
     assert!(tcp_server_result.is_ok(), "failed to start the server");
 
     let (tcp_listener, tcp_addr) = tcp_server_result.unwrap();
 
-    let udp_server_result = UdpServer::new();
-    assert!(udp_server_result.is_ok(), "failed to initialize udp server");
+    // Initialize the UDP server
+    let mut udp_server = UdpServer::new();
 
-    let udp_server = udp_server_result.unwrap();
-    assert_eq!(1, 1);
-    //let udp_server_start_result = udp_server.start();
-    //assert!(
-    //    udp_server_start_result.is_ok(),
-    //    "failed to start udp server"
-    //);
+    let proxy_info = ConnectionInfo::Ipv4 {
+        address: Ipv4Addr::new(127, 0, 0, 1),
+        port: udp_server.port(),
+    };
+    let target_info = ConnectionInfo::Ipv4 {
+        address: Ipv4Addr::new(127, 0, 0, 1),
+        port: tcp_addr.port(),
+    };
+
+    let connection_command = ConnectCommand::new(proxy_info, target_info);
+
+    assert_eq!(1, 1); // Adjust this with the actual test logic
+
+    udp_server.start();
+
+    let send_result = connection_command.send();
+    assert!(send_result.is_ok());
+
+    thread::sleep(Duration::from_secs(5));
+
+    // Perform the necessary operations for the test here...
+    // Example: Send data to the UDP server, check for responses, etc.
+
+    // Signal the server to stop and await its termination
+    assert_eq!(1, 2);
 }

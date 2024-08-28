@@ -1,13 +1,41 @@
-pub struct NetworkPacket {
-    connection_info: ConnectionInfo,
-}
-
 use crate::constants::MAX_DNS_PACKET_SIZE;
 use crate::dns_parser::ConnectionInfo;
 use rand::Rng;
+use std::error::Error;
+use std::net::{SocketAddrV4, UdpSocket};
 
-impl NetworkPacket {
-    pub fn from_connection_info(info: ConnectionInfo) -> NetworkPacket {
+pub struct NetworkPacket<'a> {
+    connection_info: &'a ConnectionInfo,
+}
+
+pub struct ConnectCommand {
+    proxy: ConnectionInfo,
+    target: ConnectionInfo,
+}
+
+impl ConnectCommand {
+    pub fn new(proxy: ConnectionInfo, target: ConnectionInfo) -> ConnectCommand {
+        ConnectCommand { proxy, target }
+    }
+    pub fn send(&self) -> Result<(), Box<dyn Error>> {
+        let bytes = NetworkPacket::from_connection_info(&self.target).to_network();
+        let socket_addr: SocketAddrV4;
+        match self.proxy {
+            ConnectionInfo::Ipv4 { address, port } => {
+                socket_addr = SocketAddrV4::new(address, port);
+            }
+            _ => return Err("Unsupported connection info".into()),
+        }
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.send_to(&bytes, socket_addr)?;
+        Ok(())
+    }
+}
+
+pub fn Connect(info: ConnectionInfo) {}
+
+impl NetworkPacket<'_> {
+    pub fn from_connection_info(info: &ConnectionInfo) -> NetworkPacket {
         NetworkPacket {
             connection_info: info,
         }
@@ -38,11 +66,10 @@ impl NetworkPacket {
         result.push(0x01); // set query bit
         result.push(0x00);
 
-        // one question
-        result.push(0x01);
+        result.push(0x00);
+        result.push(0x01); // one question
 
         // pad rest empty
-        result.push(0x00);
         result.push(0x00);
         result.push(0x00);
         result.push(0x00);
@@ -76,7 +103,7 @@ mod tests {
             port: 8080,
         };
 
-        let network_packet = NetworkPacket::from_connection_info(connection_info);
+        let network_packet = NetworkPacket::from_connection_info(&connection_info);
         let network_bytes = network_packet.to_network();
 
         assert!(network_bytes.len() < MAX_DNS_PACKET_SIZE);
@@ -85,8 +112,8 @@ mod tests {
 
         assert_eq!(network_bytes[2], 0x01);
         assert_eq!(network_bytes[3], 0x00);
-        assert_eq!(network_bytes[4], 0x01); // one question
-        assert_eq!(network_bytes[5], 0x00);
+        assert_eq!(network_bytes[4], 0x00);
+        assert_eq!(network_bytes[5], 0x01); // one question
         assert_eq!(network_bytes[6], 0x00);
         assert_eq!(network_bytes[7], 0x00);
         assert_eq!(network_bytes[8], 0x00);
@@ -94,13 +121,14 @@ mod tests {
         assert_eq!(network_bytes[10], 0x00);
         assert_eq!(network_bytes[11], 0x00);
 
-        assert_eq!(network_bytes[12], NETWORK_ADDRESS_TYPE_IPV4);
-        assert_eq!(network_bytes[13], 192);
-        assert_eq!(network_bytes[14], 168);
-        assert_eq!(network_bytes[15], 1);
-        assert_eq!(network_bytes[16], 2);
-        assert_eq!(network_bytes[17], 0x1f);
-        assert_eq!(network_bytes[18], 0x90);
+        assert_eq!(network_bytes[12], 7);
+        assert_eq!(network_bytes[13], NETWORK_ADDRESS_TYPE_IPV4);
+        assert_eq!(network_bytes[14], 192);
+        assert_eq!(network_bytes[15], 168);
+        assert_eq!(network_bytes[16], 1);
+        assert_eq!(network_bytes[17], 2);
+        assert_eq!(network_bytes[18], 0x1f);
+        assert_eq!(network_bytes[19], 0x90);
     }
 
     #[ignore]
@@ -111,7 +139,7 @@ mod tests {
             port: 8080,
         };
 
-        let network_packet = NetworkPacket::from_connection_info(connection_info);
+        let network_packet = NetworkPacket::from_connection_info(&connection_info);
         let network_bytes = network_packet.to_network();
 
         assert!(network_bytes.len() < MAX_DNS_PACKET_SIZE);

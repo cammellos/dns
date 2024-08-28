@@ -5,6 +5,7 @@ use crate::constants::{
 };
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::net::SocketAddrV4;
 
 #[derive(Debug)]
 pub enum ExtractStartConnectionHeaderError {
@@ -108,6 +109,7 @@ impl ConnectionInfo {
                 let octets = address.octets();
                 let port_bytes = port.to_be_bytes();
                 vec![
+                    7, // size
                     NETWORK_ADDRESS_TYPE_IPV4,
                     octets[0],
                     octets[1],
@@ -165,6 +167,13 @@ fn extract_start_connection_header_ipv4(buf: Vec<u8>) -> ConnectionInfo {
 }
 
 impl ConnectionHeader {
+    pub fn socket_address(&self) -> SocketAddrV4 {
+        match self.info {
+            ConnectionInfo::Ipv4 { address, port } => return SocketAddrV4::new(address, port),
+
+            _ => panic!("wrong type, expected ipv4"),
+        }
+    }
     pub fn from_network(
         buf: Vec<u8>,
     ) -> Result<ConnectionHeader, ExtractStartConnectionHeaderError> {
@@ -184,6 +193,7 @@ mod tests {
     #[test]
     fn test_extract_dns_payload_single_question() {
         let query = build_dns_query(&["reddit"]);
+        println!("QUERY: {:?}", query);
 
         let payload = extract_dns_payload(&query);
 
@@ -348,7 +358,7 @@ mod tests {
         let result = connection_info.to_network();
 
         assert_eq!(
-            vec![NETWORK_ADDRESS_TYPE_IPV4, 0xa, 0xb, 0xc, 0xd, 0x1f, 0x90],
+            vec![7, NETWORK_ADDRESS_TYPE_IPV4, 0xa, 0xb, 0xc, 0xd, 0x1f, 0x90],
             result
         );
     }

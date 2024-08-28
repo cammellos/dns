@@ -1,51 +1,97 @@
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use crate::constants::MAX_DNS_PACKET_SIZE;
+use crate::dns_parser::{extract_dns_payload, ConnectionHeader};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::net::UdpSocket;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
 
 pub struct UdpServer {
-    socket: UdpSocket,
-    port: u16,
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    socket: Arc<Mutex<UdpSocket>>,
 }
 
 impl UdpServer {
-    pub fn new() -> io::Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        let local_addr = socket.local_addr()?;
-        let port = local_addr.port();
-
-        Ok(Self { socket, port })
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn start(&self) -> io::Result<()> {
-        loop {
-            let (message, src_addr) = self.receive_message()?;
-            let message_str = String::from_utf8_lossy(&message);
-
-            println!("Received message: '{}' from {}", message_str, src_addr);
-
-            let response = b"Message received";
-            self.send_message(response, src_addr)?;
+    pub fn new() -> UdpServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("Could not bind socket");
+        socket
+            .set_nonblocking(true)
+            .expect("Could not set non-blocking");
+        UdpServer {
+            running: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            socket: Arc::new(Mutex::new(socket)),
         }
     }
 
-    fn receive_message(&self) -> io::Result<(Vec<u8>, SocketAddr)> {
-        let mut buf = [0u8; 1024]; // Adjust size as needed
-        let (size, src_addr) = self.socket.recv_from(&mut buf)?;
-        let message = buf[..size].to_vec();
-        Ok((message, src_addr))
+    pub fn start(&mut self) {
+        let running = self.running.clone();
+        let socket = self.socket.clone();
+
+        self.handle = Some(thread::spawn(move || {
+            running.store(true, Ordering::SeqCst);
+            let mut buf = [0; 1024];
+
+            while running.load(Ordering::SeqCst) {
+                if let Ok((size, src)) = socket.lock().unwrap().recv_from(&mut buf) {
+                    let received_data: [u8; MAX_DNS_PACKET_SIZE] =
+                        buf[..MAX_DNS_PACKET_SIZE].try_into().unwrap();
+                    println!("Received from {}: {:?}", src, received_data);
+                    println!(
+                        "Extracted: {:?}",
+                        extract_dns_payload(&received_data).to_vec()
+                    );
+                    let header_result =
+                        ConnectionHeader::from_network(extract_dns_payload(&received_data));
+                    match header_result {
+                        Ok(header) => {
+                            println!("successfully parsed header: {:?}", header);
+                            let socket = header.socket_address();
+                            let mut stream_result = TcpStream::connect(socket);
+                            match stream_result {
+                                Ok(mut stream) => {
+                                    let mut buffer = [0; 512];
+                                    match stream.read(&mut buffer) {
+                                        Ok(n) => {
+                                            println!(
+                                                "Received: {}",
+                                                String::from_utf8_lossy(&buffer[..n])
+                                            );
+                                        }
+                                        Err(e) => {
+                                            println!("Failed to read from TCP stream: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    println!("failed to connect to tcp: {}", err);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            println!("failed to parse header: {}", error);
+                        }
+                    }
+                } else {
+                    // Sleep for a short time to avoid busy-waiting
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }));
     }
 
-    fn send_message(&self, message: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.socket.send_to(message, addr)?;
-        Ok(())
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("Failed to join server thread");
+        }
     }
-}
 
-fn main() -> io::Result<()> {
-    let server = UdpServer::new()?;
-    println!("Server listening on port {}", server.port());
-    server.start() // Start the server and enter the event loop
+    pub fn port(&self) -> u16 {
+        self.socket.lock().unwrap().local_addr().unwrap().port()
+    }
 }
