@@ -1,5 +1,6 @@
 mod constants;
 mod dns_parser;
+mod errors;
 mod udp_server;
 mod utils;
 

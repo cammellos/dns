@@ -3,9 +3,14 @@ use crate::constants::{
     MAX_DNS_SECOND_QNAME_SIZE, NETWORK_ADDRESS_TYPE_DOMAIN_NAME, NETWORK_ADDRESS_TYPE_IPV4,
     NETWORK_ADDRESS_TYPE_IPV6,
 };
+use crate::errors::not_implemented;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::net::SocketAddrV4;
+use std::net::SocketAddrV6;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 
 #[derive(Debug)]
 pub enum ExtractStartConnectionHeaderError {
@@ -81,6 +86,14 @@ pub enum ConnectionInfo {
 }
 
 impl ConnectionInfo {
+    // TODO: add tests
+    pub fn id(&self) -> String {
+        match &self {
+            ConnectionInfo::Ipv4 { address, port } => format!("{}:{}", address, port),
+            _ => panic!("Unsupported connection type"),
+        }
+    }
+
     pub fn from_network(buf: Vec<u8>) -> Result<ConnectionInfo, ExtractStartConnectionHeaderError> {
         if buf.is_empty() {
             return Err(ExtractStartConnectionHeaderError::InvalidConnectionHeader);
@@ -122,6 +135,19 @@ impl ConnectionInfo {
             _ => {
                 vec![]
             }
+        }
+    }
+    pub async fn connect(&self) -> tokio::io::Result<impl AsyncRead + AsyncWrite + Unpin> {
+        match self {
+            ConnectionInfo::Ipv4 { address, port } => {
+                let socket = SocketAddr::V4(SocketAddrV4::new(*address, *port));
+                TcpStream::connect(socket).await
+            }
+            ConnectionInfo::Ipv6 { address, port } => {
+                let socket = SocketAddr::V6(SocketAddrV6::new(*address, *port, 0, 0));
+                TcpStream::connect(socket).await
+            }
+            _ => not_implemented(),
         }
     }
 }
@@ -401,5 +427,17 @@ mod tests {
             ],
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_connection_info_connect_domain_name() {
+        let connection_info = ConnectionInfo::DomainName {
+            name: String::from("www.movimenta.com"),
+            port: 0x1f90,
+        };
+
+        let result = connection_info.connect().await;
+
+        assert!(result.is_err());
     }
 }

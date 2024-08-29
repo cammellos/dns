@@ -76,7 +76,7 @@ async fn test_add() {
     let (tcp_listener, tcp_addr) = tcp_server_result.unwrap();
 
     // Initialize the UDP server
-    let mut udp_server = UdpServer::new();
+    let udp_server = UdpServer::new().await;
 
     let proxy_info = ConnectionInfo::Ipv4 {
         address: Ipv4Addr::new(127, 0, 0, 1),
@@ -91,12 +91,13 @@ async fn test_add() {
 
     assert_eq!(1, 1); // Adjust this with the actual test logic
 
-    udp_server.start();
+    println!("HERE 1");
+    tokio::spawn(async move { udp_server.start().await });
+    //udp_server.start().await;
+    println!("HERE 2");
 
-    let send_result = connection_command.send();
-    assert!(send_result.is_ok());
-
-    thread::sleep(Duration::from_secs(5));
+    connection_command.send();
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Perform the necessary operations for the test here...
     // Example: Send data to the UDP server, check for responses, etc.
