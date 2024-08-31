@@ -35,7 +35,6 @@ fn start_tcp_test_server() -> Result<(TcpListener, SocketAddr)> {
                 Ok(stream) => {
                     // Handle the client in a separate thread
                     thread::spawn(|| {
-                        println!("HANDLING CLIENT");
                         handle_client(stream).unwrap();
                     });
                 }
@@ -91,10 +90,8 @@ async fn test_add() {
 
     assert_eq!(1, 1); // Adjust this with the actual test logic
 
-    println!("HERE 1");
     tokio::spawn(async move { udp_server.start().await });
     //udp_server.start().await;
-    println!("HERE 2");
 
     connection_command.send();
     tokio::time::sleep(Duration::from_secs(5)).await;
