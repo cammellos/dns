@@ -11,8 +11,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the DNS query packet
     let query = utils::build_dns_query(&["www.google.co.uk", "www.guardian.co.uk"]);
 
-    let payload = dns_parser::extract_dns_payload(&query);
-    let _ = dns_parser::ConnectionHeader::from_network(payload);
+    let parsed_data = dns_parser::extract_dns_payload(&query);
+    if parsed_data.is_none() {
+        return Ok(());
+    }
+
+    let _ = dns_parser::ConnectionHeader::from_network(parsed_data.unwrap().payload);
     // Bind a UDP socket to a local address
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 

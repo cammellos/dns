@@ -31,35 +31,43 @@ impl std::fmt::Display for ExtractStartConnectionHeaderError {
     }
 }
 
+pub struct ParsedData {
+    transaction_id: u16,
+    pub payload: Vec<u8>,
+}
+
 impl std::error::Error for ExtractStartConnectionHeaderError {}
 
-pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Vec<u8> {
+pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData> {
     let number_of_questions = usize::from(buf[5]);
+    let transaction_id = 0;
 
     // Check count
     if number_of_questions == 0 {
-        return Vec::new();
+        return None;
     }
 
     // We never want to have more than 2 questions
     if number_of_questions > 2 {
-        return Vec::new();
+        return None;
     }
 
     let question_1_size_index = DNS_HEADER_SIZE;
     let question_1_data_start = question_1_size_index + 1;
     let question_1_size = usize::from(buf[question_1_size_index]);
     let question_1_data_end = question_1_data_start + question_1_size;
-
     let question_1_data = &buf[question_1_data_start..question_1_data_end];
 
     if number_of_questions == 1 {
-        return question_1_data.to_vec();
+        return Some(ParsedData {
+            transaction_id,
+            payload: question_1_data.to_vec(),
+        });
     }
 
     // if there are two questions, one needs to be maxed out
     if question_1_size != MAX_DNS_FIRST_QNAME_SIZE {
-        return Vec::new();
+        return None;
     }
 
     let question_2_size_index = question_1_data_end + DNS_TYPE_CLASS_SIZE + 1;
@@ -68,14 +76,17 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Vec<u8> {
     let question_2_data_end = question_2_data_start + question_2_size;
 
     if question_2_size > MAX_DNS_SECOND_QNAME_SIZE {
-        return Vec::new();
+        return None;
     }
 
-    let mut result = Vec::with_capacity(question_1_size + question_2_size);
+    let mut payload = Vec::with_capacity(question_1_size + question_2_size);
 
-    result.extend_from_slice(question_1_data);
-    result.extend_from_slice(&buf[question_2_data_start..question_2_data_end]);
-    result
+    payload.extend_from_slice(question_1_data);
+    payload.extend_from_slice(&buf[question_2_data_start..question_2_data_end]);
+    Some(ParsedData {
+        transaction_id,
+        payload,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -221,36 +232,45 @@ mod tests {
         let query = build_dns_query(&["reddit"]);
         println!("QUERY: {:?}", query);
 
-        let payload = extract_dns_payload(&query);
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_some());
+
+        let parsed_data = parsed_data_result.unwrap();
 
         let expected = [0x72, 0x65, 0x64, 0x64, 0x69, 0x74];
 
-        assert_eq!(expected, *payload);
+        assert_eq!(expected, *parsed_data.payload);
     }
 
     #[test]
     fn test_extract_dns_payload_single_question_maxed_out() {
         let query = build_dns_query(&[&"a".repeat(MAX_DNS_FIRST_QNAME_SIZE)]);
 
-        let payload = extract_dns_payload(&query);
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_some());
+
+        let parsed_data = parsed_data_result.unwrap();
 
         let mut expected = vec![b'a'; MAX_DNS_FIRST_QNAME_SIZE];
         expected.extend(vec![b'b'; MAX_DNS_SECOND_QNAME_SIZE]);
 
-        assert_eq!(vec![b'a'; MAX_DNS_FIRST_QNAME_SIZE], payload);
+        assert_eq!(vec![b'a'; MAX_DNS_FIRST_QNAME_SIZE], parsed_data.payload);
     }
 
     #[test]
     fn test_extract_dns_payload_two_questions() {
         let query = build_dns_query(&[&"a".repeat(MAX_DNS_FIRST_QNAME_SIZE), "reddit"]);
 
-        let payload = extract_dns_payload(&query);
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_some());
+
+        let parsed_data = parsed_data_result.unwrap();
 
         let mut expected = vec![b'a'; MAX_DNS_FIRST_QNAME_SIZE];
         expected.extend(vec![b'r', b'e', b'd', b'd', b'i', b't']);
 
-        assert_eq!(expected.len(), payload.len());
-        assert_eq!(expected, payload);
+        assert_eq!(expected.len(), parsed_data.payload.len());
+        assert_eq!(expected, parsed_data.payload);
     }
 
     #[test]
@@ -260,22 +280,24 @@ mod tests {
             &"b".repeat(MAX_DNS_SECOND_QNAME_SIZE),
         ]);
 
-        let payload = extract_dns_payload(&query);
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_some());
+
+        let parsed_data = parsed_data_result.unwrap();
 
         let mut expected = vec![b'a'; MAX_DNS_FIRST_QNAME_SIZE];
         expected.extend(vec![b'b'; MAX_DNS_SECOND_QNAME_SIZE]);
 
-        assert_eq!(expected.len(), payload.len());
-        assert_eq!(expected, payload);
+        assert_eq!(expected.len(), parsed_data.payload.len());
+        assert_eq!(expected, parsed_data.payload);
     }
 
     #[test]
     fn test_extract_dns_payload_empty_buffer() {
         let query: [u8; MAX_DNS_PACKET_SIZE] = [0; MAX_DNS_PACKET_SIZE];
 
-        let payload = extract_dns_payload(&query);
-
-        assert!(payload.is_empty());
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_none());
     }
 
     #[test]
@@ -284,9 +306,8 @@ mod tests {
         query[DNS_HEADER_SIZE] = u8::MAX;
         query[DNS_HEADER_SIZE + DNS_TYPE_CLASS_SIZE + 2 + MAX_DNS_FIRST_QNAME_SIZE] = u8::MAX;
 
-        let payload = extract_dns_payload(&query);
-
-        assert!(payload.is_empty());
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_none());
     }
 
     #[test]
@@ -299,9 +320,8 @@ mod tests {
         query[DNS_HEADER_SIZE + DNS_TYPE_CLASS_SIZE + 2 + MAX_DNS_FIRST_QNAME_SIZE] =
             (MAX_DNS_SECOND_QNAME_SIZE + 1) as u8;
 
-        let payload = extract_dns_payload(&query);
-
-        assert!(payload.is_empty());
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_none());
     }
 
     #[test]

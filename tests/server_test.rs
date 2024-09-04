@@ -88,8 +88,6 @@ async fn test_add() {
 
     let connection_command = ConnectCommand::new(proxy_info, target_info);
 
-    assert_eq!(1, 1); // Adjust this with the actual test logic
-
     tokio::spawn(async move { udp_server.start().await });
     //udp_server.start().await;
 
