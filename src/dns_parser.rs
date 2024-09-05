@@ -32,7 +32,7 @@ impl std::fmt::Display for ExtractStartConnectionHeaderError {
 }
 
 pub struct ParsedData {
-    transaction_id: u16,
+    pub transaction_id: u16,
     pub payload: Vec<u8>,
 }
 
@@ -48,17 +48,20 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
 
     // Check count
     if number_of_questions == 0 {
+        println!("number of questions is 0");
         return None;
     }
 
     // We never want to have more than 2 questions
     if number_of_questions > 2 {
+        println!("number of questions is > 2");
         return None;
     }
 
     let transaction_id = read_transaction_id(buf);
 
     if transaction_id == 0 {
+        println!("transaction id is missing");
         return None;
     }
 
@@ -77,6 +80,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
 
     // if there are two questions, one needs to be maxed out
     if question_1_size != MAX_DNS_FIRST_QNAME_SIZE {
+        println!("question 1 is not maxed out, but multiple questions are there");
         return None;
     }
 
@@ -86,6 +90,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
     let question_2_data_end = question_2_data_start + question_2_size;
 
     if question_2_size > MAX_DNS_SECOND_QNAME_SIZE {
+        println!("question 2 size is too large");
         return None;
     }
 

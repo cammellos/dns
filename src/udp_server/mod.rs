@@ -86,9 +86,10 @@ where
     }
 }
 
-// ConnectionManager stores active connections.
+#[derive(Debug)]
 struct Connection {
     client_to_target_sender: mpsc::Sender<Vec<u8>>,
+    transaction_id: u16,
 }
 
 struct ConnectionManager {
@@ -120,6 +121,19 @@ pub struct UdpServer {
     socket: UdpSocket,
 }
 
+#[derive(Debug)]
+enum Command {
+    NewConnection {
+        connection_id: String,
+        transaction_id: u16,
+        header: ConnectionHeader,
+    },
+}
+
+fn src_and_transaction_id_to_string(src: SocketAddr, transaction_id: u16) -> String {
+    return format!("{}-{}", src.to_string(), transaction_id.to_string());
+}
+
 impl UdpServer {
     pub async fn new() -> UdpServer {
         let socket = UdpSocket::bind("127.0.0.1:0")
@@ -128,21 +142,23 @@ impl UdpServer {
         UdpServer { socket: socket }
     }
 
-    async fn handle_received_data(
+    fn handle_received_data(
         connection_manager: &mut ConnectionManager,
         buf: &[u8],
         size: usize,
         src: SocketAddr,
-    ) {
+    ) -> Result<Command, String> {
         let mut received_data: [u8; MAX_DNS_PACKET_SIZE] = [0; MAX_DNS_PACKET_SIZE];
         received_data[..size].copy_from_slice(&buf[..size]);
         println!("Received from {}: {:?}", src, received_data);
         let parsed_data: ParsedData;
         match extract_dns_payload(&received_data) {
             Some(data) => parsed_data = data,
-            None => return,
+            None => return Err("failed to parse payload".to_string()),
         }
         let payload = parsed_data.payload;
+        let transaction_id = parsed_data.transaction_id;
+        let connection_id = src_and_transaction_id_to_string(src, transaction_id);
         println!("Extracted: {:?}", payload.to_vec());
 
         let header_result = ConnectionHeader::from_network(payload);
@@ -150,45 +166,13 @@ impl UdpServer {
             Ok(header) => {
                 println!("Successfully parsed header: {:?}", header.info);
 
-                let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
-                let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
-
-                let connection = Connection {
-                    client_to_target_sender,
-                };
-
-                connection_manager.add(header.info.id(), connection);
-
-                let connection_handler;
-                let stream_result = header.info.connect().await;
-                match stream_result {
-                    Ok(client_target_stream) => {
-                        connection_handler = ConnectionHandler {
-                            client_target_stream,
-                            target: header.info,
-                            client_to_target_receiver,
-                            target_to_client_sender,
-                        };
-                    }
-                    Err(e) => {
-                        println!("error connecting: {}", e);
-                        return;
-                    }
-                }
-                tokio::spawn(async move {
-                    connection_handler.start().await;
-                    loop {
-                        tokio::select! {
-                            Some(message) = target_to_client_receiver.recv() => {
-                                println!("Received2: {}", String::from_utf8_lossy(&message));
-                            }
-                        }
-                    }
-                });
+                Ok(Command::NewConnection {
+                    header,
+                    connection_id,
+                    transaction_id,
+                })
             }
-            Err(error) => {
-                println!("Failed to parse header: {}", error);
-            }
+            Err(error) => Err(format!("failed to parse header: {}", error)),
         }
     }
 
@@ -202,7 +186,53 @@ impl UdpServer {
                     // get the sender ip address/port
                     // if it's a header, calculate an id;q
                     //
-                    UdpServer::handle_received_data(&mut connection_manager, &buf, size, src);
+                    match UdpServer::handle_received_data(&mut connection_manager, &buf, size, src)
+                    {
+                        Ok(Command::NewConnection {
+                            transaction_id,
+                            connection_id,
+                            header,
+                        }) => {
+                            let (client_to_target_sender, client_to_target_receiver) =
+                                mpsc::channel(32);
+                            let (target_to_client_sender, mut target_to_client_receiver) =
+                                mpsc::channel(32);
+
+                            let connection = Connection {
+                                transaction_id,
+                                client_to_target_sender,
+                            };
+
+                            connection_manager.add(connection_id, connection);
+                            let connection_handler;
+                            let stream_result = header.info.connect().await;
+                            match stream_result {
+                                Ok(client_target_stream) => {
+                                    connection_handler = ConnectionHandler {
+                                        client_target_stream,
+                                        target: header.info,
+                                        client_to_target_receiver,
+                                        target_to_client_sender,
+                                    };
+                                }
+                                Err(e) => {
+                                    println!("error connection: {}", e);
+                                    return ();
+                                }
+                            }
+                            tokio::spawn(async move {
+                                connection_handler.start().await;
+                                loop {
+                                    tokio::select! {
+                                        Some(message) = target_to_client_receiver.recv() => {
+                                            println!("Received2: {}", String::from_utf8_lossy(&message));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => println!("ha"),
+                    }
                 }
                 Err(e) => {
                     println!("Failed to receive data: {}", e);
@@ -220,8 +250,10 @@ impl UdpServer {
 mod test {
 
     use crate::dns_parser::ConnectionInfo;
+    use crate::network_packet::NetworkPacket;
     use crate::udp_server::{Connection, ConnectionHandler, ConnectionManager, UdpServer};
     use std::io::Error;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
@@ -466,6 +498,7 @@ mod test {
 
         let (client_to_target_sender, _) = mpsc::channel(32);
         let connection = Connection {
+            transaction_id: 1,
             client_to_target_sender,
         };
 
@@ -482,5 +515,50 @@ mod test {
             Some(_) => panic!("should not be getting anything"),
             _ => {}
         }
+    }
+
+    #[test]
+    fn test_handle_received_data_new_connection() {
+        let mut connection_manager = ConnectionManager::new();
+
+        let target = ConnectionInfo::Ipv4 {
+            address: Ipv4Addr::new(127, 0, 0, 1),
+            port: 80,
+        };
+
+        let bytes = NetworkPacket::from_connection_info(&target).to_network();
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let result =
+            UdpServer::handle_received_data(&mut connection_manager, &bytes, bytes.len(), socket);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_received_data_existing_connection() {
+        let mut connection_manager = ConnectionManager::new();
+
+        let target = ConnectionInfo::Ipv4 {
+            address: Ipv4Addr::new(127, 0, 0, 1),
+            port: 80,
+        };
+
+        let bytes = NetworkPacket::from_connection_info(&target).to_network();
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let result =
+            UdpServer::handle_received_data(&mut connection_manager, &bytes, bytes.len(), socket);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_received_data_malformed_data() {
+        let mut connection_manager = ConnectionManager::new();
+        let buf = [0x1, 0x2];
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let result =
+            UdpServer::handle_received_data(&mut connection_manager, &buf, buf.len(), socket);
+        assert!(result.is_err());
     }
 }
