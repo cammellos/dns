@@ -13,7 +13,6 @@ fn domain_to_qname(domain: &str, buffer: &mut [u8], offset: &mut usize) {
 }
 
 pub fn wrap_data_in_dns_queries(data: Vec<u8>) -> [u8; MAX_DNS_PACKET_SIZE] {
-    
     [0u8; MAX_DNS_PACKET_SIZE]
 }
 
@@ -23,8 +22,8 @@ pub fn build_dns_query(domains: &[&str]) -> [u8; MAX_DNS_PACKET_SIZE] {
 
     // Fill DNS Header
     // ID
-    buffer[offset] = 0x12;
-    buffer[offset + 1] = 0x34;
+    buffer[offset] = 0x01;
+    buffer[offset + 1] = 0x02;
     offset += 2;
 
     // Flags (standard query with recursion)

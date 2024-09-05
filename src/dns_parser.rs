@@ -38,9 +38,13 @@ pub struct ParsedData {
 
 impl std::error::Error for ExtractStartConnectionHeaderError {}
 
+fn read_transaction_id(data: &[u8; 512]) -> u16 {
+    let bytes = [data[0], data[1]];
+    u16::from_be_bytes(bytes) // Big-endian
+}
+
 pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData> {
     let number_of_questions = usize::from(buf[5]);
-    let transaction_id = 0;
 
     // Check count
     if number_of_questions == 0 {
@@ -49,6 +53,12 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
 
     // We never want to have more than 2 questions
     if number_of_questions > 2 {
+        return None;
+    }
+
+    let transaction_id = read_transaction_id(buf);
+
+    if transaction_id == 0 {
         return None;
     }
 
@@ -228,9 +238,32 @@ mod tests {
     use crate::utils::build_dns_query;
 
     #[test]
+    fn test_extract_dns_payload_transaction_id() {
+        let query = build_dns_query(&["reddit"]);
+
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_some());
+
+        let parsed_data = parsed_data_result.unwrap();
+
+        assert_eq!(258, parsed_data.transaction_id);
+    }
+
+    #[test]
+    fn test_extract_dns_payload_no_transaction_id() {
+        let mut query = build_dns_query(&["reddit"]);
+
+        // blank transaction id
+        query[0] = 0;
+        query[1] = 0;
+
+        let parsed_data_result = extract_dns_payload(&query);
+        assert!(parsed_data_result.is_none());
+    }
+
+    #[test]
     fn test_extract_dns_payload_single_question() {
         let query = build_dns_query(&["reddit"]);
-        println!("QUERY: {:?}", query);
 
         let parsed_data_result = extract_dns_payload(&query);
         assert!(parsed_data_result.is_some());
