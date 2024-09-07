@@ -163,7 +163,7 @@ impl ConnectionInfo {
             }
         }
     }
-    pub async fn connect(&self) -> tokio::io::Result<impl AsyncRead + AsyncWrite + Unpin> {
+    pub async fn connect(&self) -> tokio::io::Result<tokio::net::TcpStream> {
         match self {
             ConnectionInfo::Ipv4 { address, port } => {
                 let socket = SocketAddr::V4(SocketAddrV4::new(*address, *port));
@@ -221,8 +221,6 @@ fn extract_start_connection_header_ipv4(buf: Vec<u8>) -> ConnectionInfo {
 impl ConnectionHeader {
     pub fn socket_address(&self) -> SocketAddrV4 {
         match self.info {
-            ConnectionInfo::Ipv4 { address, port } => return SocketAddrV4::new(address, port),
-
             _ => panic!("wrong type, expected ipv4"),
         }
     }
