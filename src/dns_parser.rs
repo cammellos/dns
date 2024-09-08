@@ -36,11 +36,53 @@ pub struct ParsedData {
     pub payload: Vec<u8>,
 }
 
+pub fn wrap_answer(transaction_id: u16, data: &[u8]) -> Vec<u8> {
+    let mut response = Vec::with_capacity(12 + data.len()); // Reserve space for header + data
+
+    // Insert transaction ID (big-endian format)
+    response.push((transaction_id >> 8) as u8); // High byte
+    response.push((transaction_id & 0xFF) as u8); // Low byte
+
+    // DNS header flags for a standard response (e.g., 0x8180)
+    response.push(0x81); // Response flag (QR = 1, opcode = 0000, AA = 1, TC = 0, RD = 1)
+    response.push(0x80); // RA = 1, Z = 000, RCODE = 0000 (no error)
+
+    // Question count (set to 1, since this is a response to a query)
+    response.push(0x00);
+    response.push(0x01);
+
+    // Answer count (set to 1, assuming there's 1 answer)
+    response.push(0x00);
+    response.push(0x01);
+
+    // Authority record count (set to 0)
+    response.push(0x00);
+    response.push(0x00);
+
+    // Additional record count (set to 0)
+    response.push(0x00);
+    response.push(0x00);
+
+    // Append the actual data (the answer section)
+    response.extend_from_slice(data);
+
+    response
+}
+
 impl std::error::Error for ExtractStartConnectionHeaderError {}
 
-fn read_transaction_id(data: &[u8; 512]) -> u16 {
-    let bytes = [data[0], data[1]];
-    u16::from_be_bytes(bytes) // Big-endian
+pub fn extract_dns_payload_from_answer(buf: &[u8]) -> Option<ParsedData> {
+    let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
+
+    if transaction_id == 0 {
+        println!("transaction id is missing");
+        return None;
+    }
+
+    Some(ParsedData {
+        payload: buf[DNS_HEADER_SIZE..buf.len()].to_vec(),
+        transaction_id,
+    })
 }
 
 pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData> {
@@ -58,7 +100,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
         return None;
     }
 
-    let transaction_id = read_transaction_id(buf);
+    let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
 
     if transaction_id == 0 {
         println!("transaction id is missing");
@@ -495,5 +537,128 @@ mod tests {
         let result = connection_info.connect().await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrap_answer_with_empty_data() {
+        let transaction_id = 0x1234;
+        let data: Vec<u8> = vec![];
+
+        let response = wrap_answer(transaction_id, &data);
+
+        // Check response length: 12 bytes for header + 0 bytes for data
+        assert_eq!(response.len(), 12);
+
+        // Check the transaction ID (0x1234)
+        assert_eq!(response[0], 0x12);
+        assert_eq!(response[1], 0x34);
+
+        // Check the flags (0x8180)
+        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
+
+        // Check question count (0x0001)
+        assert_eq!(response[4], 0x00);
+        assert_eq!(response[5], 0x01);
+
+        // Check answer count (0x0001)
+        assert_eq!(response[6], 0x00);
+        assert_eq!(response[7], 0x01);
+
+        // Check authority record count (0x0000)
+        assert_eq!(response[8], 0x00);
+        assert_eq!(response[9], 0x00);
+
+        // Check additional record count (0x0000)
+        assert_eq!(response[10], 0x00);
+        assert_eq!(response[11], 0x00);
+    }
+
+    #[test]
+    fn test_wrap_answer_with_data() {
+        let transaction_id = 0x5678;
+        let data: Vec<u8> = vec![0x12, 0x34, 0x56, 0x78]; // Some dummy answer data
+
+        let response = wrap_answer(transaction_id, &data);
+
+        // Check response length: 12 bytes for header + 4 bytes for data
+        assert_eq!(response.len(), 12 + data.len());
+
+        // Check the transaction ID (0x5678)
+        assert_eq!(response[0], 0x56);
+        assert_eq!(response[1], 0x78);
+
+        // Check the flags (0x8180)
+        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
+
+        // Check question count (0x0001)
+        assert_eq!(response[4], 0x00);
+        assert_eq!(response[5], 0x01);
+
+        // Check answer count (0x0001)
+        assert_eq!(response[6], 0x00);
+        assert_eq!(response[7], 0x01);
+
+        // Check authority record count (0x0000)
+        assert_eq!(response[8], 0x00);
+        assert_eq!(response[9], 0x00);
+
+        // Check additional record count (0x0000)
+        assert_eq!(response[10], 0x00);
+        assert_eq!(response[11], 0x00);
+
+        // Check appended data
+        assert_eq!(&response[12..], &data[..]);
+    }
+
+    #[test]
+    fn test_wrap_answer_with_large_data() {
+        let transaction_id = 0x9ABC;
+        let data: Vec<u8> = vec![0xAB; 512]; // 512 bytes of dummy data
+
+        let response = wrap_answer(transaction_id, &data);
+
+        // Check response length: 12 bytes for header + 512 bytes for data
+        assert_eq!(response.len(), 12 + data.len());
+
+        // Check the transaction ID (0x9ABC)
+        assert_eq!(response[0], 0x9A);
+        assert_eq!(response[1], 0xBC);
+
+        // Check the flags (0x8180)
+        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
+
+        // Check question count (0x0001)
+        assert_eq!(response[4], 0x00);
+        assert_eq!(response[5], 0x01);
+
+        // Check answer count (0x0001)
+        assert_eq!(response[6], 0x00);
+        assert_eq!(response[7], 0x01);
+
+        // Check authority record count (0x0000)
+        assert_eq!(response[8], 0x00);
+        assert_eq!(response[9], 0x00);
+
+        // Check additional record count (0x0000)
+        assert_eq!(response[10], 0x00);
+        assert_eq!(response[11], 0x00);
+
+        // Check appended data
+        assert_eq!(&response[12..], &data[..]);
+    }
+
+    #[test]
+    fn test_wrap_answer_with_short_transaction_id() {
+        let transaction_id = 0x01; // Single byte transaction ID
+        let data: Vec<u8> = vec![];
+
+        let response = wrap_answer(transaction_id, &data);
+
+        // Check transaction ID is correctly padded
+        assert_eq!(response[0], 0x00);
+        assert_eq!(response[1], 0x01);
     }
 }

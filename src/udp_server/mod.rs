@@ -1,5 +1,7 @@
 use crate::constants::MAX_DNS_PACKET_SIZE;
-use crate::dns_parser::{extract_dns_payload, ConnectionHeader, ConnectionInfo, ParsedData};
+use crate::dns_parser::{
+    extract_dns_payload, wrap_answer, ConnectionHeader, ConnectionInfo, ParsedData,
+};
 use log;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,6 +19,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     client_target_stream: S,
+    transaction_id: u16,
     target: ConnectionInfo,
     client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
     target_to_client_sender: mpsc::Sender<Vec<u8>>,
@@ -32,12 +35,14 @@ where
     pub fn new(
         client_target_stream: S,
         target: ConnectionInfo,
+        transaction_id: u16,
         client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
         target_to_client_sender: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         Self {
             client_target_stream,
             target,
+            transaction_id,
             client_to_target_receiver,
             target_to_client_sender,
         }
@@ -47,12 +52,14 @@ where
         target: ConnectionInfo,
         client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
         target_to_client_sender: mpsc::Sender<Vec<u8>>,
+        transaction_id: u16,
     ) -> Result<(), String> {
         match target.connect().await {
             Ok(client_target_stream) => {
                 let connection_handler = ConnectionHandler {
                     client_target_stream,
                     target,
+                    transaction_id,
                     client_to_target_receiver,
                     target_to_client_sender,
                 };
@@ -69,6 +76,7 @@ where
     }
 
     async fn start(mut self) {
+        log::debug!("starting connection handler: {}", self.transaction_id);
         loop {
             let mut buffer = vec![0u8; 512];
             tokio::select! {
@@ -90,7 +98,7 @@ where
                     Ok(n) if n > 0 => {
 
                         log::debug!("received: {}, passing back", String::from_utf8_lossy(&buffer[..n]));
-                        self.target_to_client_sender.send(buffer).await.unwrap();
+                        self.target_to_client_sender.send(wrap_answer(self.transaction_id, &buffer[0..n])).await.unwrap();
                     }
                     Ok(_) => {
                         log::debug!("connection closed");
@@ -220,6 +228,7 @@ impl UdpServer {
         target: ConnectionInfo,
         client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
         target_to_client_sender: mpsc::Sender<Vec<u8>>,
+        transaction_id: u16,
     ) {
         let connection_string = format!("target: {:?}", target);
         log::debug!("connecting to: {}", connection_string);
@@ -229,6 +238,7 @@ impl UdpServer {
             target,
             client_to_target_receiver,
             target_to_client_sender,
+            transaction_id,
         )
         .await
         {
@@ -277,6 +287,7 @@ impl UdpServer {
                     header.info,
                     client_to_target_receiver,
                     target_to_client_sender,
+                    transaction_id,
                 ));
             }
             Err(e) => {
@@ -321,6 +332,7 @@ impl UdpServer {
 #[cfg(test)]
 mod test {
 
+    use crate::dns_parser::extract_dns_payload_from_answer;
     use crate::dns_parser::ConnectionInfo;
     use crate::network_packet::NetworkPacket;
     use crate::udp_server::{
@@ -339,7 +351,7 @@ mod test {
     use tokio::time::{timeout, Duration};
     use tokio_test::io::Builder;
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_connection_handler_start() {
         let client_target_stream = Builder::new()
             .read(b"hello") // Simulate the stream reading "hello"
@@ -358,6 +370,7 @@ mod test {
         let handler = ConnectionHandler::new(
             client_target_stream,
             mock_target,
+            1,
             client_to_target_receiver,
             target_to_client_sender,
         );
@@ -373,13 +386,23 @@ mod test {
             .unwrap();
 
         if let Some(received) = target_to_client_receiver.recv().await {
-            assert_eq!(received[0..5], b"hello".to_vec());
+            assert_eq!(
+                extract_dns_payload_from_answer(received.as_slice())
+                    .unwrap()
+                    .payload,
+                b"hello".to_vec()
+            );
         } else {
             panic!("Did not receive expected data");
         }
 
         if let Some(received) = target_to_client_receiver.recv().await {
-            assert_eq!(received[0..6], b"hello2".to_vec());
+            assert_eq!(
+                extract_dns_payload_from_answer(received.as_slice())
+                    .unwrap()
+                    .payload,
+                b"hello2".to_vec()
+            );
         } else {
             panic!("Did not receive expected data");
         }
@@ -388,7 +411,7 @@ mod test {
         assert!(res.is_ok());
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_connection_handler_target_closed() {
         let client_target_stream = Builder::new().build();
 
@@ -403,6 +426,7 @@ mod test {
         let handler = ConnectionHandler::new(
             client_target_stream,
             mock_target,
+            1,
             client_to_target_receiver,
             target_to_client_sender,
         );
@@ -416,7 +440,7 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_connection_handler_failed_to_read() {
         // Simulate a read error
         let client_target_stream = Builder::new()
@@ -438,6 +462,7 @@ mod test {
         let handler = ConnectionHandler::new(
             client_target_stream,
             mock_target,
+            1,
             client_to_target_receiver,
             target_to_client_sender,
         );
@@ -451,7 +476,7 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_connection_handler_interrupted() {
         // Simulate a read error
         let client_target_stream = Builder::new()
@@ -473,6 +498,7 @@ mod test {
         let handler = ConnectionHandler::new(
             client_target_stream,
             mock_target,
+            1,
             client_to_target_receiver,
             target_to_client_sender,
         );
@@ -482,14 +508,21 @@ mod test {
         });
 
         if let Some(received) = target_to_client_receiver.recv().await {
-            assert_eq!(received[0..4], b"test".to_vec());
+            assert_eq!(
+                extract_dns_payload_from_answer(received.as_slice())
+                    .unwrap()
+                    .payload,
+                b"test".to_vec()
+            );
         } else {
             panic!("interrupted error should continue reading");
         }
+        // write to make sure the channel is kept open and the loop doesn't quit earlier
+        let _ = client_to_target_sender.send(b"test".to_vec()).await;
     }
 
     #[ignore] // currently tests hangs, wouldblock seems to be handled differently
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_connection_handler_would_block() {
         // Simulate a read error
         let client_target_stream = Builder::new()
@@ -511,6 +544,7 @@ mod test {
         let handler = ConnectionHandler::new(
             client_target_stream,
             mock_target,
+            1,
             client_to_target_receiver,
             target_to_client_sender,
         );
@@ -527,7 +561,7 @@ mod test {
     }
 
     #[ignore]
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_udp_server_real_socket() {
         // Start the UDP server
         let server = UdpServer::new().await;
@@ -777,7 +811,9 @@ mod test {
             port: actual_port,
         };
 
-        let bytes = NetworkPacket::from_connection_info(&target).to_network();
+        let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
+        bytes[0] = 0x01;
+        bytes[1] = 0x02;
 
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -791,10 +827,16 @@ mod test {
 
         // check that data is returned
         if let Some(received_data) = receiver.recv().await {
-            assert_eq!(
-                "Hello, this is the server: 0",
-                String::from_utf8_lossy(&received_data[0..28])
-            );
+            match extract_dns_payload_from_answer(received_data.as_slice()) {
+                Some(parsed_data) => {
+                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(
+                        "Hello, this is the server: 0",
+                        String::from_utf8_lossy(&parsed_data.payload),
+                    );
+                }
+                None => panic!("data malformed"),
+            };
         } else {
             panic!("Data was not sent to the existing connection");
         }
@@ -810,12 +852,18 @@ mod test {
         .await
         .unwrap();
 
-        // check if data was returned
+        // check that data is returned
         if let Some(received_data) = receiver.recv().await {
-            assert_eq!(
-                "Hello, this is the server: 1",
-                String::from_utf8_lossy(&received_data[0..28])
-            );
+            match extract_dns_payload_from_answer(received_data.as_slice()) {
+                Some(parsed_data) => {
+                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(
+                        "Hello, this is the server: 1",
+                        String::from_utf8_lossy(&parsed_data.payload),
+                    );
+                }
+                None => panic!("data malformed"),
+            };
         } else {
             panic!("Data was not sent to the existing connection");
         }
