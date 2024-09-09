@@ -1,7 +1,7 @@
 use crate::constants::{
-    DNS_HEADER_SIZE, DNS_TYPE_CLASS_SIZE, MAX_DNS_FIRST_QNAME_SIZE, MAX_DNS_PACKET_SIZE,
-    MAX_DNS_SECOND_QNAME_SIZE, NETWORK_ADDRESS_TYPE_DOMAIN_NAME, NETWORK_ADDRESS_TYPE_IPV4,
-    NETWORK_ADDRESS_TYPE_IPV6,
+    DNS_HEADER_SIZE, DNS_QNAME_METADATA_SIZE, DNS_TYPE_CLASS_SIZE, MAX_DNS_FIRST_QNAME_SIZE,
+    MAX_DNS_PACKET_SIZE, MAX_DNS_SECOND_QNAME_SIZE, MAX_PAYLOAD_SIZE,
+    NETWORK_ADDRESS_TYPE_DOMAIN_NAME, NETWORK_ADDRESS_TYPE_IPV4, NETWORK_ADDRESS_TYPE_IPV6,
 };
 use crate::errors::not_implemented;
 use std::net::Ipv4Addr;
@@ -75,7 +75,7 @@ pub fn extract_dns_payload_from_answer(buf: &[u8]) -> Option<ParsedData> {
     let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
 
     if transaction_id == 0 {
-        println!("transaction id is missing");
+        log::warn!("transaction id is missing");
         return None;
     }
 
@@ -85,25 +85,115 @@ pub fn extract_dns_payload_from_answer(buf: &[u8]) -> Option<ParsedData> {
     })
 }
 
+pub fn create_dns_packet(transaction_id: u16, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() == 0 {
+        return None;
+    }
+    // Validate payload length
+    if payload.len() > MAX_DNS_SECOND_QNAME_SIZE + MAX_DNS_FIRST_QNAME_SIZE {
+        log::warn!(
+            "payload length is greater than total available space: have {} want max: {} {}",
+            payload.len(),
+            MAX_DNS_SECOND_QNAME_SIZE,
+            MAX_DNS_FIRST_QNAME_SIZE
+        );
+        return None;
+    }
+
+    // Initialize buffer with DNS header size
+    let mut packet = vec![0u8; DNS_HEADER_SIZE];
+
+    // Set transaction_id (2 bytes, big-endian)
+    packet[0..2].copy_from_slice(&transaction_id.to_be_bytes());
+
+    // Set flags and number of questions (simplified for this example)
+    packet[2] = 0x01; // QR, Opcode, AA, TC, RD
+    packet[3] = 0x00; // Z, RCODE
+    packet[4] = 0x00; // Number of questions (will be set later)
+    packet[5] = 0x01; // Number of questions (1 or 2 based on payload size)
+    packet[6..8].copy_from_slice(&[0x00, 0x00]); // Number of answers
+    packet[8..10].copy_from_slice(&[0x00, 0x00]); // Number of authority records
+    packet[10..12].copy_from_slice(&[0x00, 0x00]); // Number of additional records
+
+    // Add first question
+    let question_1_size = payload.len().min(MAX_DNS_FIRST_QNAME_SIZE);
+
+    // Ensure there is space for at least one question
+    if DNS_HEADER_SIZE + question_1_size + DNS_TYPE_CLASS_SIZE + DNS_QNAME_METADATA_SIZE
+        > MAX_DNS_PACKET_SIZE
+    {
+        return None;
+    }
+
+    log::debug!("adding question 1 size at index: {}", packet.len());
+    // Append question 1 size and data
+    packet.push(question_1_size as u8); // Size of the first question
+    packet.extend_from_slice(&payload[..question_1_size]);
+
+    // Add Null + DNS TYPE and CLASS for the first question
+    let dns_type_class = [0x00, 0x00, 0x01, 0x00, 0x01]; // Type A (0x01) and Class IN (0x01)
+    packet.extend_from_slice(&dns_type_class);
+
+    // If payload is larger than what fits in one question
+    if payload.len() > question_1_size {
+        let question_2_size = payload.len() - question_1_size;
+
+        // Ensure space for second question and its data
+        if DNS_HEADER_SIZE + question_2_size + DNS_TYPE_CLASS_SIZE + DNS_QNAME_METADATA_SIZE
+            > MAX_DNS_PACKET_SIZE
+        {
+            log::warn!("not enough space for the second question + data");
+            return None;
+        }
+
+        // set number of questions
+        packet[5] = 0x2;
+        log::debug!("adding question 2 size at index: {}", packet.len());
+        // Append question 2 size and data
+        packet.push(question_2_size as u8); // Size of the second question
+        packet.extend_from_slice(&payload[question_1_size..]);
+
+        // Add DNS TYPE and CLASS for the second question
+        packet.extend_from_slice(&dns_type_class);
+    }
+
+    // Ensure packet does not exceed the maximum size
+    if packet.len() > MAX_DNS_PACKET_SIZE {
+        log::warn!(
+            "packet exceeds max dns packet size: have {} want {}",
+            packet.len(),
+            MAX_DNS_PACKET_SIZE
+        );
+        return None;
+    }
+
+    Some(packet)
+}
+
 pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData> {
     let number_of_questions = usize::from(buf[5]);
 
+    log::debug!(
+        "extracting dns payload. number of questions: {}",
+        number_of_questions
+    );
+
     // Check count
     if number_of_questions == 0 {
-        println!("number of questions is 0");
+        log::warn!("number of questions is 0");
         return None;
     }
 
     // We never want to have more than 2 questions
     if number_of_questions > 2 {
-        println!("number of questions is > 2");
+        log::warn!("number of questions is > 2");
         return None;
     }
 
     let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
 
     if transaction_id == 0 {
-        println!("transaction id is missing");
+        log::warn!("transaction id is missing");
         return None;
     }
 
@@ -112,6 +202,12 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
     let question_1_size = usize::from(buf[question_1_size_index]);
     let question_1_data_end = question_1_data_start + question_1_size;
     let question_1_data = &buf[question_1_data_start..question_1_data_end];
+
+    log::debug!(
+        "question 1 size is: {}, index is at: {}",
+        question_1_size,
+        question_1_size_index
+    );
 
     if number_of_questions == 1 {
         return Some(ParsedData {
@@ -122,7 +218,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
 
     // if there are two questions, one needs to be maxed out
     if question_1_size != MAX_DNS_FIRST_QNAME_SIZE {
-        println!("question 1 is not maxed out, but multiple questions are there");
+        log::warn!("question 1 is not maxed out, but multiple questions are there");
         return None;
     }
 
@@ -131,8 +227,14 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
     let question_2_size = usize::from(buf[question_2_size_index]);
     let question_2_data_end = question_2_data_start + question_2_size;
 
+    log::debug!(
+        "question 2 size is: {}, index is at: {}",
+        question_2_size,
+        question_2_size_index
+    );
+
     if question_2_size > MAX_DNS_SECOND_QNAME_SIZE {
-        println!("question 2 size is too large");
+        log::warn!("question 2 size is too large");
         return None;
     }
 
@@ -281,6 +383,7 @@ mod tests {
 
     use super::*;
     use crate::utils::build_dns_query;
+    use test_log::test;
 
     #[test]
     fn test_extract_dns_payload_transaction_id() {
@@ -527,7 +630,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_connection_info_connect_domain_name() {
         let connection_info = ConnectionInfo::DomainName {
             name: String::from("www.movimenta.com"),
@@ -660,5 +763,88 @@ mod tests {
         // Check transaction ID is correctly padded
         assert_eq!(response[0], 0x00);
         assert_eq!(response[1], 0x01);
+    }
+
+    #[test]
+    fn test_create_dns_packet_single_question() {
+        let transaction_id = 12345;
+        let payload = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+        let packet = create_dns_packet(transaction_id, &payload).unwrap();
+        let mut buf = [0u8; MAX_DNS_PACKET_SIZE];
+        buf[..packet.len()].copy_from_slice(&packet);
+
+        let parsed = extract_dns_payload(&buf).unwrap();
+        assert_eq!(parsed.transaction_id, transaction_id);
+        assert_eq!(parsed.payload, payload);
+    }
+
+    #[test]
+    fn test_create_dns_packet_multiple_questions() {
+        let transaction_id = 12345;
+        let payload = vec![1; MAX_DNS_FIRST_QNAME_SIZE + 1];
+
+        let packet = create_dns_packet(transaction_id, &payload).unwrap();
+        let mut buf = [0u8; MAX_DNS_PACKET_SIZE];
+        buf[..packet.len()].copy_from_slice(&packet);
+
+        let parsed = extract_dns_payload(&buf).unwrap();
+        assert_eq!(parsed.transaction_id, transaction_id);
+        assert_eq!(parsed.payload, payload);
+    }
+
+    #[test]
+    fn test_create_dns_packet_truncated() {
+        let transaction_id = 12345;
+        let payload = vec![1; MAX_DNS_PACKET_SIZE - DNS_HEADER_SIZE + 1];
+
+        let packet = create_dns_packet(transaction_id, &payload);
+        assert!(packet.is_none()); // Payload too large for single packet
+    }
+
+    #[test]
+    fn test_create_dns_packet_max_size() {
+        let transaction_id = 12345;
+        let payload = vec![1; MAX_PAYLOAD_SIZE];
+
+        let packet = create_dns_packet(transaction_id, &payload).unwrap();
+        let mut buf = [0u8; MAX_DNS_PACKET_SIZE];
+        buf[..packet.len()].copy_from_slice(&packet);
+        println!("{:?}", buf);
+
+        let parsed = extract_dns_payload(&buf).unwrap();
+        assert_eq!(parsed.transaction_id, transaction_id);
+        assert_eq!(parsed.payload.len(), payload.len());
+        assert_eq!(parsed.payload, payload);
+    }
+
+    #[test]
+    fn test_create_dns_packet_edge_cases() {
+        let transaction_id = 12345;
+        let empty_payload = vec![];
+        let single_byte_payload = vec![1];
+        let max_payload = vec![1; MAX_DNS_FIRST_QNAME_SIZE];
+
+        // Test empty payload
+        let packet = create_dns_packet(transaction_id, &empty_payload);
+        assert!(packet.is_none());
+
+        // Test single byte payload
+        let packet = create_dns_packet(transaction_id, &single_byte_payload).unwrap();
+        let mut buf = [0u8; MAX_DNS_PACKET_SIZE];
+        buf[..packet.len()].copy_from_slice(&packet);
+
+        let parsed = extract_dns_payload(&buf).unwrap();
+        assert_eq!(parsed.transaction_id, transaction_id);
+        assert_eq!(parsed.payload, single_byte_payload);
+
+        // Test maximum payload size
+        let packet = create_dns_packet(transaction_id, &max_payload).unwrap();
+        let mut buf = [0u8; MAX_DNS_PACKET_SIZE];
+        buf[..packet.len()].copy_from_slice(&packet);
+
+        let parsed = extract_dns_payload(&buf).unwrap();
+        assert_eq!(parsed.transaction_id, transaction_id);
+        assert_eq!(parsed.payload, max_payload);
     }
 }

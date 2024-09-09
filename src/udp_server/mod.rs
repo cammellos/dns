@@ -1,4 +1,4 @@
-use crate::constants::MAX_DNS_PACKET_SIZE;
+use crate::constants::{DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
 use crate::dns_parser::{
     extract_dns_payload, wrap_answer, ConnectionHeader, ConnectionInfo, ParsedData,
 };
@@ -98,7 +98,7 @@ where
                 result = self.params.client_target_stream.read(&mut buffer) => match result {
                     Ok(n) if n > 0 => {
 
-                        log::debug!("received: {}, passing back", String::from_utf8_lossy(&buffer[..n]));
+                        log::debug!("received: {} {}, passing back", String::from_utf8_lossy(&buffer[..n]), n);
                         let packet = TargetToClientPacket{
                             connection_id: self.params.connection_id.clone(),
                             data: wrap_answer(self.params.transaction_id, &buffer[0..n]),
@@ -270,13 +270,13 @@ impl UdpServer {
         log::debug!("new packet received");
         match UdpServer::parse_received_data(connection_manager, buf, size, src) {
             Ok(Command::ExistingConnection { connection_id }) => {
-                log::debug!("existing connection, sending packet forward");
+                log::debug!("existing connection, sending packet forward: {}", size);
                 if let Some(connection) = connection_manager.get(&connection_id) {
                     connection
                         .client_to_target_sender
                         .send(TargetToClientPacket {
                             connection_id,
-                            data: buf[..size].to_vec(),
+                            data: buf[DNS_HEADER_SIZE..size].to_vec(),
                         })
                         .await
                         .map_err(|e| format!("Failed to send data: {}", e))?;
@@ -373,6 +373,7 @@ impl UdpServer {
 #[cfg(test)]
 mod test {
 
+    use crate::constants::{DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
     use crate::dns_parser::extract_dns_payload_from_answer;
     use crate::dns_parser::ConnectionInfo;
     use crate::network_packet::NetworkPacket;
@@ -662,7 +663,7 @@ mod test {
 
     #[test(tokio::test)]
     async fn test_udp_server_real_socket() {
-        let tcp_server_result = start_tcp_test_server().await;
+        let tcp_server_result = start_tcp_test_server(false).await;
         assert!(tcp_server_result.is_ok(), "failed to start the server");
 
         let tcp_addr = tcp_server_result.unwrap();
@@ -848,7 +849,7 @@ mod test {
     use std::io::{Result, Write};
     use tokio::net::{TcpListener, TcpStream};
 
-    async fn handle_client(mut stream: TcpStream) -> Result<()> {
+    async fn handle_client(mut stream: TcpStream, echo: bool) -> Result<()> {
         let mut counter = 0;
         let response = format!("Hello, this is the server: {}", counter);
         stream.write_all(response.as_bytes()).await;
@@ -859,12 +860,17 @@ mod test {
             tokio::select! {
                 result = stream.read(&mut buffer) => match result {
                     Ok(n) if n > 0 => {
-                        counter +=1;
-                        let response = format!("Hello, this is the server: {}", counter);
-                        stream.write_all(response.as_bytes()).await;
-                        stream.flush().await;
+                        if echo {
+                            stream.write_all(&buffer[..n]).await;
+                            stream.flush().await;
+                        } else {
+                            counter +=1;
+                            let response = format!("Hello, this is the server: {}", counter);
+                            stream.write_all(response.as_bytes()).await;
+                            stream.flush().await;
 
-                        log::debug!("tcp server: received: {}, passing back", String::from_utf8_lossy(&buffer[..n]));
+                        }
+                        log::debug!("tcp server: received: {:?} - {}, passing back", &buffer[..n], n);
                     }
                     Ok(_) => {
                         log::debug!("tcp server: connection closed");
@@ -887,7 +893,7 @@ mod test {
         }
     }
 
-    async fn start_tcp_test_server() -> Result<(SocketAddr)> {
+    async fn start_tcp_test_server(echo: bool) -> Result<(SocketAddr)> {
         // Bind to a dynamic port (0 lets the OS choose an available port)
         let listener = TcpListener::bind("127.0.0.1:0").await?;
 
@@ -902,7 +908,7 @@ mod test {
                     Ok((stream, _addr)) => {
                         // Spawn a new task to handle the client
                         tokio::task::spawn(async move {
-                            if let Err(e) = handle_client(stream).await {
+                            if let Err(e) = handle_client(stream, echo).await {
                                 log::error!("failed to handle client: {}", e);
                             }
                         });
@@ -919,7 +925,7 @@ mod test {
 
     #[test(tokio::test)]
     async fn test_handle_socket_data_new_connection() {
-        let tcp_server_result = start_tcp_test_server().await;
+        let tcp_server_result = start_tcp_test_server(false).await;
         assert!(tcp_server_result.is_ok(), "failed to start the server");
 
         let tcp_addr = tcp_server_result.unwrap();
@@ -974,6 +980,101 @@ mod test {
             &mut connection_manager,
             &bytes,
             bytes.len(),
+            src,
+            sender.clone(),
+        )
+        .await
+        .unwrap();
+
+        // check that data is returned
+        if let Some(received_data) = receiver.recv().await {
+            let data = received_data.data.as_slice();
+            assert_eq!(received_data.connection_id, connection_id);
+            match extract_dns_payload_from_answer(data) {
+                Some(parsed_data) => {
+                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(
+                        "Hello, this is the server: 1",
+                        String::from_utf8_lossy(&parsed_data.payload),
+                    );
+                }
+                None => panic!("data malformed"),
+            };
+        } else {
+            panic!("Data was not sent to the existing connection");
+        }
+    }
+
+    #[test(tokio::test)]
+    async fn test_handle_socket_data_out_of_order() {
+        let tcp_server_result = start_tcp_test_server(true).await;
+        assert!(tcp_server_result.is_ok(), "failed to start the server");
+
+        let tcp_addr = tcp_server_result.unwrap();
+
+        let mut connection_manager = ConnectionManager::new();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), tcp_addr.port());
+
+        let actual_address = Ipv4Addr::new(127, 0, 0, 1);
+        let actual_port = tcp_addr.port();
+        let target = ConnectionInfo::Ipv4 {
+            address: actual_address,
+            port: actual_port,
+        };
+
+        let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
+        bytes[0] = 0x01;
+        bytes[1] = 0x02;
+        let connection_id = format!("127.0.0.1:{}-258", actual_port);
+
+        UdpServer::handle_new_packet(
+            &mut connection_manager,
+            &bytes,
+            bytes.len(),
+            src,
+            sender.clone(),
+        )
+        .await
+        .unwrap();
+
+        // check that data is returned
+        if let Some(received_data) = receiver.recv().await {
+            let data = received_data.data.as_slice();
+            match extract_dns_payload_from_answer(data) {
+                Some(parsed_data) => {
+                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(
+                        "Hello, this is the server: 0",
+                        String::from_utf8_lossy(&parsed_data.payload),
+                    );
+                }
+                None => panic!("data malformed"),
+            };
+        } else {
+            panic!("Data was not sent to the existing connection");
+        }
+
+        let mut second_packet: Vec<u8> = vec![0; DNS_HEADER_SIZE + 10];
+
+        second_packet[DNS_HEADER_SIZE] = 0x00;
+        second_packet[DNS_HEADER_SIZE + 1] = 0x00;
+        second_packet[DNS_HEADER_SIZE + 2] = 0x00;
+        second_packet[DNS_HEADER_SIZE + 3] = 0x02;
+        second_packet[DNS_HEADER_SIZE + 4] = b's';
+        second_packet[DNS_HEADER_SIZE + 5] = b'e';
+        second_packet[DNS_HEADER_SIZE + 6] = b'c';
+        second_packet[DNS_HEADER_SIZE + 7] = b'o';
+        second_packet[DNS_HEADER_SIZE + 8] = b'n';
+        second_packet[DNS_HEADER_SIZE + 9] = b'd';
+
+        // send more data
+        UdpServer::handle_new_packet(
+            &mut connection_manager,
+            &second_packet,
+            second_packet.len(),
             src,
             sender.clone(),
         )
