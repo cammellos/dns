@@ -12,17 +12,25 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+struct ConnectionParams<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    client_target_stream: S,
+    transaction_id: u16,
+    connection_id: String,
+    target: ConnectionInfo,
+    client_to_target_receiver: mpsc::Receiver<TargetToClientPacket>,
+    target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
+}
+
 // ConnectionHandler manages a single TCP connection.
 //
 struct ConnectionHandler<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    client_target_stream: S,
-    transaction_id: u16,
-    target: ConnectionInfo,
-    client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
-    target_to_client_sender: mpsc::Sender<Vec<u8>>,
+    params: ConnectionParams<S>,
 }
 
 // 1) Wait on the tcp connection and send back
@@ -32,39 +40,29 @@ impl<S> ConnectionHandler<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn new(
-        client_target_stream: S,
-        target: ConnectionInfo,
-        transaction_id: u16,
-        client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
-        target_to_client_sender: mpsc::Sender<Vec<u8>>,
-    ) -> Self {
-        Self {
-            client_target_stream,
-            target,
-            transaction_id,
-            client_to_target_receiver,
-            target_to_client_sender,
-        }
+    pub fn new(params: ConnectionParams<S>) -> Self {
+        Self { params }
     }
 
     pub async fn connect(
         target: ConnectionInfo,
-        client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
-        target_to_client_sender: mpsc::Sender<Vec<u8>>,
+        client_to_target_receiver: mpsc::Receiver<TargetToClientPacket>,
+        target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
         transaction_id: u16,
+        connection_id: String,
     ) -> Result<(), String> {
         match target.connect().await {
             Ok(client_target_stream) => {
-                let connection_handler = ConnectionHandler {
-                    client_target_stream,
-                    target,
-                    transaction_id,
-                    client_to_target_receiver,
-                    target_to_client_sender,
-                };
                 tokio::spawn(async move {
-                    connection_handler.start().await;
+                    let params = ConnectionParams {
+                        client_target_stream,
+                        target,
+                        connection_id,
+                        transaction_id,
+                        client_to_target_receiver,
+                        target_to_client_sender,
+                    };
+                    ConnectionHandler::new(params).start().await;
                 });
                 Ok(())
             }
@@ -76,14 +74,17 @@ where
     }
 
     async fn start(mut self) {
-        log::debug!("starting connection handler: {}", self.transaction_id);
+        log::debug!(
+            "starting connection handler: {}",
+            self.params.transaction_id
+        );
         loop {
             let mut buffer = vec![0u8; 512];
             tokio::select! {
-                message = self.client_to_target_receiver.recv() => {
+                message = self.params.client_to_target_receiver.recv() => {
                     log::debug!("received packet to forward to target");
                     if let Some(msg) = message {
-                        if let Err(e) = self.client_target_stream.write_all(&msg).await {
+                        if let Err(e) = self.params.client_target_stream.write_all(&msg.data).await {
                             log::error!("failed to write to stream: {}", e);
                             return;
                         }
@@ -94,11 +95,15 @@ where
                     }
 
                 }
-                result = self.client_target_stream.read(&mut buffer) => match result {
+                result = self.params.client_target_stream.read(&mut buffer) => match result {
                     Ok(n) if n > 0 => {
 
                         log::debug!("received: {}, passing back", String::from_utf8_lossy(&buffer[..n]));
-                        self.target_to_client_sender.send(wrap_answer(self.transaction_id, &buffer[0..n])).await.unwrap();
+                        let packet = TargetToClientPacket{
+                            connection_id: self.params.connection_id.clone(),
+                            data: wrap_answer(self.params.transaction_id, &buffer[0..n]),
+                        };
+                        self.params.target_to_client_sender.send(packet).await.unwrap();
                     }
                     Ok(_) => {
                         log::debug!("connection closed");
@@ -122,10 +127,16 @@ where
     }
 }
 
+struct TargetToClientPacket {
+    connection_id: String,
+    data: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct Connection {
-    client_to_target_sender: mpsc::Sender<Vec<u8>>,
+    client_to_target_sender: mpsc::Sender<TargetToClientPacket>,
     transaction_id: u16,
+    src: SocketAddr,
 }
 
 struct ConnectionManager {
@@ -226,9 +237,10 @@ impl UdpServer {
 
     async fn handle_new_connection(
         target: ConnectionInfo,
-        client_to_target_receiver: mpsc::Receiver<Vec<u8>>,
-        target_to_client_sender: mpsc::Sender<Vec<u8>>,
+        client_to_target_receiver: mpsc::Receiver<TargetToClientPacket>,
+        target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
         transaction_id: u16,
+        connection_id: String,
     ) {
         let connection_string = format!("target: {:?}", target);
         log::debug!("connecting to: {}", connection_string);
@@ -239,6 +251,7 @@ impl UdpServer {
             client_to_target_receiver,
             target_to_client_sender,
             transaction_id,
+            connection_id,
         )
         .await
         {
@@ -252,7 +265,7 @@ impl UdpServer {
         buf: &[u8],
         size: usize,
         src: SocketAddr,
-        target_to_client_sender: mpsc::Sender<Vec<u8>>,
+        target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
     ) -> Result<(), String> {
         log::debug!("new packet received");
         match UdpServer::parse_received_data(connection_manager, buf, size, src) {
@@ -261,7 +274,10 @@ impl UdpServer {
                 if let Some(connection) = connection_manager.get(&connection_id) {
                     connection
                         .client_to_target_sender
-                        .send(buf[..size].to_vec())
+                        .send(TargetToClientPacket {
+                            connection_id,
+                            data: buf[..size].to_vec(),
+                        })
                         .await
                         .map_err(|e| format!("Failed to send data: {}", e))?;
                     log::debug!("sent packet forward");
@@ -273,11 +289,13 @@ impl UdpServer {
                 header,
             }) => {
                 log::debug!("new connection: {}", connection_id);
+                let connection_id_copy = connection_id.clone();
                 let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
                 //let (target_to_client_sender, target_to_client_receiver) = mpsc::channel(32);
 
                 let connection = Connection {
                     transaction_id,
+                    src,
                     client_to_target_sender,
                 };
 
@@ -288,6 +306,7 @@ impl UdpServer {
                     client_to_target_receiver,
                     target_to_client_sender,
                     transaction_id,
+                    connection_id_copy,
                 ));
             }
             Err(e) => {
@@ -300,25 +319,47 @@ impl UdpServer {
     pub async fn start(&self) {
         let mut connection_manager = ConnectionManager::new();
         let mut buf = vec![0u8; MAX_DNS_PACKET_SIZE];
-        let (target_to_client_sender, target_to_client_receiver) = mpsc::channel(32);
+        let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
 
         loop {
-            match self.socket.recv_from(&mut buf).await {
-                Ok((size, src)) => {
-                    if let Err(e) = UdpServer::handle_new_packet(
-                        &mut connection_manager,
-                        &buf,
-                        size,
-                        src,
-                        target_to_client_sender.clone(),
-                    )
-                    .await
-                    {
-                        println!("Failed to handle socket data: {}", e);
+            tokio::select! {
+            result = self.socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((size, src)) => {
+                        if let Err(e) = UdpServer::handle_new_packet(
+                            &mut connection_manager,
+                            &buf,
+                            size,
+                            src,
+                            target_to_client_sender.clone(),
+                        )
+                        .await
+                        {
+                            log::error!("failed to handle socket data: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("failed to receive data: {}", e);
                     }
                 }
-                Err(e) => {
-                    println!("Failed to receive data: {}", e);
+            }
+                Some(message) = target_to_client_receiver.recv() => {
+                    let connection_id = message.connection_id;
+                    let connection_result = connection_manager.get(&connection_id);
+                    log::info!("received message on channel: {:?}", message.data);
+                    match connection_result  {
+                        Some(connection) => {
+                            log::debug!("connection found: {}", connection_id);
+                            let bytes_sent_result = self.socket.send_to(&message.data, connection.src).await;
+                                match bytes_sent_result {
+                                  Ok(bytes_sent) =>  log::debug!("sent {} to {}", bytes_sent, connection.src),
+                                  Err(e) => log::error!("failed to send to {} with error: {}", connection.src, e),
+                                }
+                        }
+                        None => {
+                            log::warn!("connection not found: {}", connection_id);
+                        }
+                    }
                 }
             }
         }
@@ -337,7 +378,7 @@ mod test {
     use crate::network_packet::NetworkPacket;
     use crate::udp_server::{
         src_and_transaction_id_to_string, Command, Connection, ConnectionHandler,
-        ConnectionManager, UdpServer,
+        ConnectionManager, ConnectionParams, TargetToClientPacket, UdpServer,
     };
     use std::io::Error;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -366,14 +407,16 @@ mod test {
             address: "127.0.0.1".parse().unwrap(),
             port: 8080,
         };
-
-        let handler = ConnectionHandler::new(
+        let params = ConnectionParams {
             client_target_stream,
-            mock_target,
-            1,
+            target: mock_target,
+            transaction_id: 1,
+            connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
-        );
+        };
+
+        let handler = ConnectionHandler::new(params);
 
         let handler_future = tokio::spawn(async move {
             handler.start().await;
@@ -381,15 +424,17 @@ mod test {
 
         // Simulate sending data to the target
         client_to_target_sender
-            .send(b"response1".to_vec())
+            .send(TargetToClientPacket {
+                data: b"response1".to_vec(),
+                connection_id: "test".to_string(),
+            })
             .await
             .unwrap();
 
         if let Some(received) = target_to_client_receiver.recv().await {
+            let data = received.data.as_slice();
             assert_eq!(
-                extract_dns_payload_from_answer(received.as_slice())
-                    .unwrap()
-                    .payload,
+                extract_dns_payload_from_answer(data).unwrap().payload,
                 b"hello".to_vec()
             );
         } else {
@@ -397,10 +442,9 @@ mod test {
         }
 
         if let Some(received) = target_to_client_receiver.recv().await {
+            let data = received.data.as_slice();
             assert_eq!(
-                extract_dns_payload_from_answer(received.as_slice())
-                    .unwrap()
-                    .payload,
+                extract_dns_payload_from_answer(data).unwrap().payload,
                 b"hello2".to_vec()
             );
         } else {
@@ -422,21 +466,26 @@ mod test {
             address: "127.0.0.1".parse().unwrap(),
             port: 8080,
         };
-
-        let handler = ConnectionHandler::new(
+        let params = ConnectionParams {
             client_target_stream,
-            mock_target,
-            1,
+            target: mock_target,
+            transaction_id: 1,
+            connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
-        );
+        };
+
+        let handler = ConnectionHandler::new(params);
 
         let _handler_future = tokio::spawn(async move {
             handler.start().await;
         });
 
         if let Some(received) = target_to_client_receiver.recv().await {
-            panic!("received some data while we should not: {:?}", received);
+            panic!(
+                "received some data while we should not: {:?}",
+                received.data
+            );
         }
     }
 
@@ -459,20 +508,26 @@ mod test {
             port: 8080,
         };
 
-        let handler = ConnectionHandler::new(
+        let params = ConnectionParams {
             client_target_stream,
-            mock_target,
-            1,
+            target: mock_target,
+            transaction_id: 1,
+            connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
-        );
+        };
+
+        let handler = ConnectionHandler::new(params);
 
         tokio::spawn(async move {
             handler.start().await;
         });
 
         if let Some(received) = target_to_client_receiver.recv().await {
-            panic!("received some data while we should not: {:?}", received);
+            panic!(
+                "received some data while we should not: {:?}",
+                received.data
+            );
         }
     }
 
@@ -495,30 +550,71 @@ mod test {
             port: 8080,
         };
 
-        let handler = ConnectionHandler::new(
+        let params = ConnectionParams {
             client_target_stream,
-            mock_target,
-            1,
+            target: mock_target,
+            transaction_id: 1,
+            connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
-        );
+        };
+
+        let handler = ConnectionHandler::new(params);
 
         tokio::spawn(async move {
             handler.start().await;
         });
 
         if let Some(received) = target_to_client_receiver.recv().await {
+            let data = received.data.as_slice();
             assert_eq!(
-                extract_dns_payload_from_answer(received.as_slice())
-                    .unwrap()
-                    .payload,
+                extract_dns_payload_from_answer(data).unwrap().payload,
                 b"test".to_vec()
             );
         } else {
             panic!("interrupted error should continue reading");
         }
         // write to make sure the channel is kept open and the loop doesn't quit earlier
-        let _ = client_to_target_sender.send(b"test".to_vec()).await;
+        let _ = client_to_target_sender
+            .send(TargetToClientPacket {
+                data: b"test".to_vec(),
+                connection_id: "test".to_string(),
+            })
+            .await;
+    }
+
+    #[test(tokio::test)]
+    async fn test_connection_handler_close_reader() {
+        // Simulate a read error
+        let client_target_stream = Builder::new().write(b"test").build();
+
+        let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
+        let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
+        drop(client_to_target_sender);
+
+        let mock_target = ConnectionInfo::Ipv4 {
+            address: "127.0.0.1".parse().unwrap(),
+            port: 8080,
+        };
+
+        let params = ConnectionParams {
+            client_target_stream,
+            target: mock_target,
+            transaction_id: 1,
+            connection_id: "test".to_string(),
+            client_to_target_receiver,
+            target_to_client_sender,
+        };
+        let handler = ConnectionHandler::new(params);
+
+        tokio::spawn(async move {
+            handler.start().await;
+        });
+
+        // we wait, but it should stop as the channel is dropped
+        if let Some(_) = target_to_client_receiver.recv().await {
+            panic!("we should never receive anything");
+        }
     }
 
     #[ignore] // currently tests hangs, wouldblock seems to be handled differently
@@ -541,28 +637,47 @@ mod test {
             port: 8080,
         };
 
-        let handler = ConnectionHandler::new(
+        let params = ConnectionParams {
             client_target_stream,
-            mock_target,
-            1,
+            target: mock_target,
+            transaction_id: 1,
+            connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
-        );
+        };
+
+        let handler = ConnectionHandler::new(params);
 
         tokio::spawn(async move {
             handler.start().await;
         });
 
         if let Some(received) = target_to_client_receiver.recv().await {
-            assert_eq!(received[0..4], b"test".to_vec());
+            let data = &received.data[0..4];
+            assert_eq!(data, b"test".to_vec());
         } else {
             panic!("Would block error should continue reading");
         }
     }
 
-    #[ignore]
     #[test(tokio::test)]
     async fn test_udp_server_real_socket() {
+        let tcp_server_result = start_tcp_test_server().await;
+        assert!(tcp_server_result.is_ok(), "failed to start the server");
+
+        let tcp_addr = tcp_server_result.unwrap();
+
+        let actual_address = Ipv4Addr::new(127, 0, 0, 1);
+        let actual_port = tcp_addr.port();
+        let target = ConnectionInfo::Ipv4 {
+            address: actual_address,
+            port: actual_port,
+        };
+
+        let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
+        bytes[0] = 0x01;
+        bytes[1] = 0x02;
+
         // Start the UDP server
         let server = UdpServer::new().await;
         let port = server.port();
@@ -577,11 +692,7 @@ mod test {
         let server_addr = format!("127.0.0.1:{}", port);
 
         // Send a test message to the server
-        let test_message = b"test data";
-        client_socket
-            .send_to(test_message, &server_addr)
-            .await
-            .unwrap();
+        client_socket.send_to(&bytes, &server_addr).await.unwrap();
 
         // Prepare a buffer to receive the server's response
         let mut buf = [0u8; 512];
@@ -593,7 +704,13 @@ mod test {
         match response {
             Ok(Ok((size, _))) => {
                 // Validate the server's response
-                assert_eq!(&buf[..size], b"expected response");
+                match extract_dns_payload_from_answer(&buf[..size]) {
+                    Some(parsed_data) => {
+                        assert_eq!(parsed_data.transaction_id, 258);
+                        assert_eq!(parsed_data.payload, b"Hello, this is the server: 0");
+                    }
+                    None => panic!("data malformed"),
+                }
             }
             Ok(Err(e)) => panic!("Failed to receive data: {}", e),
             Err(_) => panic!("Test timed out waiting for response"),
@@ -611,15 +728,22 @@ mod test {
         }
 
         let (client_to_target_sender, _) = mpsc::channel(32);
+
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
         let connection = Connection {
             transaction_id: 1,
+            src,
             client_to_target_sender,
         };
 
         connection_manager.add(connection_id.to_string(), connection);
 
         match connection_manager.get(connection_id) {
-            Some(_) => {}
+            Some(connection) => {
+                assert_eq!(connection.transaction_id, 1);
+                assert_eq!(connection.src, src);
+            }
             _ => panic!("it should retrieve the record"),
         }
 
@@ -690,7 +814,9 @@ mod test {
         let connection_id = src_and_transaction_id_to_string(socket, transaction_id);
         let (client_to_target_sender, _) = mpsc::channel(32);
 
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let connection = Connection {
+            src,
             transaction_id,
             client_to_target_sender,
         };
@@ -777,12 +903,12 @@ mod test {
                         // Spawn a new task to handle the client
                         tokio::task::spawn(async move {
                             if let Err(e) = handle_client(stream).await {
-                                eprintln!("Failed to handle client: {}", e);
+                                log::error!("failed to handle client: {}", e);
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("Failed to accept a connection: {}", e);
+                        log::error!("failed to accept a connection: {}", e);
                     }
                 }
             }
@@ -814,6 +940,7 @@ mod test {
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
         bytes[0] = 0x01;
         bytes[1] = 0x02;
+        let connection_id = format!("127.0.0.1:{}-258", actual_port);
 
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -827,7 +954,8 @@ mod test {
 
         // check that data is returned
         if let Some(received_data) = receiver.recv().await {
-            match extract_dns_payload_from_answer(received_data.as_slice()) {
+            let data = received_data.data.as_slice();
+            match extract_dns_payload_from_answer(data) {
                 Some(parsed_data) => {
                     assert_eq!(parsed_data.transaction_id, 258);
                     assert_eq!(
@@ -854,7 +982,9 @@ mod test {
 
         // check that data is returned
         if let Some(received_data) = receiver.recv().await {
-            match extract_dns_payload_from_answer(received_data.as_slice()) {
+            let data = received_data.data.as_slice();
+            assert_eq!(received_data.connection_id, connection_id);
+            match extract_dns_payload_from_answer(data) {
                 Some(parsed_data) => {
                     assert_eq!(parsed_data.transaction_id, 258);
                     assert_eq!(
