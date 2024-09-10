@@ -32,16 +32,16 @@ impl std::fmt::Display for ExtractStartConnectionHeaderError {
 }
 
 pub struct ParsedData {
-    pub transaction_id: u16,
+    pub transaction_id: u8,
+    pub sequence_number: u8,
     pub payload: Vec<u8>,
 }
 
-pub fn wrap_answer(transaction_id: u16, data: &[u8]) -> Vec<u8> {
+pub fn wrap_answer(transaction_id: u8, sequence_number: u8, data: &[u8]) -> Vec<u8> {
     let mut response = Vec::with_capacity(12 + data.len()); // Reserve space for header + data
 
-    // Insert transaction ID (big-endian format)
-    response.push((transaction_id >> 8) as u8); // High byte
-    response.push((transaction_id & 0xFF) as u8); // Low byte
+    response.push(transaction_id); // High byte
+    response.push(sequence_number); // Low byte
 
     // DNS header flags for a standard response (e.g., 0x8180)
     response.push(0x81); // Response flag (QR = 1, opcode = 0000, AA = 1, TC = 0, RD = 1)
@@ -69,23 +69,57 @@ pub fn wrap_answer(transaction_id: u16, data: &[u8]) -> Vec<u8> {
     response
 }
 
+pub fn wrap_query(transaction_id: u8, sequence_number: u8, query_data: &[u8]) -> Vec<u8> {
+    let mut query = Vec::with_capacity(12 + query_data.len()); // Reserve space for header + query
+
+    query.push(transaction_id);
+    query.push(sequence_number);
+
+    // DNS header flags for a standard query (e.g., 0x0100)
+    query.push(0x01); // Query flag (QR = 0, opcode = 0000, AA = 0, TC = 0, RD = 1)
+    query.push(0x00); // RA = 0, Z = 000, RCODE = 0000
+
+    // Question count (set to 1, we're querying a single domain)
+    query.push(0x00);
+    query.push(0x01);
+
+    // Answer count (set to 0, since this is a query)
+    query.push(0x00);
+    query.push(0x00);
+
+    // Authority record count (set to 0)
+    query.push(0x00);
+    query.push(0x00);
+
+    // Additional record count (set to 0)
+    query.push(0x00);
+    query.push(0x00);
+
+    // Append the actual query data (the question section, e.g., domain name + type + class)
+    query.extend_from_slice(query_data);
+
+    query
+}
+
 impl std::error::Error for ExtractStartConnectionHeaderError {}
 
 pub fn extract_dns_payload_from_answer(buf: &[u8]) -> Option<ParsedData> {
-    let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let transaction_id = buf[0];
 
     if transaction_id == 0 {
         log::warn!("transaction id is missing");
         return None;
     }
+    let sequence_number = buf[1];
 
     Some(ParsedData {
+        sequence_number,
         payload: buf[DNS_HEADER_SIZE..buf.len()].to_vec(),
         transaction_id,
     })
 }
 
-pub fn create_dns_packet(transaction_id: u16, payload: &[u8]) -> Option<Vec<u8>> {
+pub fn create_dns_packet(transaction_id: u8, payload: &[u8]) -> Option<Vec<u8>> {
     if payload.len() == 0 {
         return None;
     }
@@ -103,8 +137,8 @@ pub fn create_dns_packet(transaction_id: u16, payload: &[u8]) -> Option<Vec<u8>>
     // Initialize buffer with DNS header size
     let mut packet = vec![0u8; DNS_HEADER_SIZE];
 
-    // Set transaction_id (2 bytes, big-endian)
-    packet[0..2].copy_from_slice(&transaction_id.to_be_bytes());
+    packet[0] = transaction_id;
+    packet[1] = 0x00;
 
     // Set flags and number of questions (simplified for this example)
     packet[2] = 0x01; // QR, Opcode, AA, TC, RD
@@ -190,7 +224,8 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
         return None;
     }
 
-    let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let transaction_id = buf[0];
+    let sequence_number = buf[1];
 
     if transaction_id == 0 {
         log::warn!("transaction id is missing");
@@ -211,6 +246,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
 
     if number_of_questions == 1 {
         return Some(ParsedData {
+            sequence_number,
             transaction_id,
             payload: question_1_data.to_vec(),
         });
@@ -243,6 +279,7 @@ pub fn extract_dns_payload(buf: &[u8; MAX_DNS_PACKET_SIZE]) -> Option<ParsedData
     payload.extend_from_slice(question_1_data);
     payload.extend_from_slice(&buf[question_2_data_start..question_2_data_end]);
     Some(ParsedData {
+        sequence_number,
         transaction_id,
         payload,
     })
@@ -394,7 +431,7 @@ mod tests {
 
         let parsed_data = parsed_data_result.unwrap();
 
-        assert_eq!(258, parsed_data.transaction_id);
+        assert_eq!(0x1, parsed_data.transaction_id);
     }
 
     #[test]
@@ -644,15 +681,16 @@ mod tests {
 
     #[test]
     fn test_wrap_answer_with_empty_data() {
-        let transaction_id = 0x1234;
+        let transaction_id = 0x12;
+        let sequence_number = 0x34;
         let data: Vec<u8> = vec![];
 
-        let response = wrap_answer(transaction_id, &data);
+        let response = wrap_answer(transaction_id, sequence_number, &data);
 
         // Check response length: 12 bytes for header + 0 bytes for data
         assert_eq!(response.len(), 12);
 
-        // Check the transaction ID (0x1234)
+        // Check the transaction ID (0x12)
         assert_eq!(response[0], 0x12);
         assert_eq!(response[1], 0x34);
 
@@ -679,15 +717,15 @@ mod tests {
 
     #[test]
     fn test_wrap_answer_with_data() {
-        let transaction_id = 0x5678;
+        let transaction_id = 0x56;
+        let sequence_number = 0x78;
         let data: Vec<u8> = vec![0x12, 0x34, 0x56, 0x78]; // Some dummy answer data
 
-        let response = wrap_answer(transaction_id, &data);
+        let response = wrap_answer(transaction_id, sequence_number, &data);
 
         // Check response length: 12 bytes for header + 4 bytes for data
         assert_eq!(response.len(), 12 + data.len());
 
-        // Check the transaction ID (0x5678)
         assert_eq!(response[0], 0x56);
         assert_eq!(response[1], 0x78);
 
@@ -717,15 +755,16 @@ mod tests {
 
     #[test]
     fn test_wrap_answer_with_large_data() {
-        let transaction_id = 0x9ABC;
+        let transaction_id = 0x9A;
+        let sequence_number = 0xBC;
         let data: Vec<u8> = vec![0xAB; 512]; // 512 bytes of dummy data
 
-        let response = wrap_answer(transaction_id, &data);
+        let response = wrap_answer(transaction_id, sequence_number, &data);
 
         // Check response length: 12 bytes for header + 512 bytes for data
         assert_eq!(response.len(), 12 + data.len());
 
-        // Check the transaction ID (0x9ABC)
+        // Check the transaction ID (0x9A)
         assert_eq!(response[0], 0x9A);
         assert_eq!(response[1], 0xBC);
 
@@ -754,20 +793,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_answer_with_short_transaction_id() {
-        let transaction_id = 0x01; // Single byte transaction ID
-        let data: Vec<u8> = vec![];
-
-        let response = wrap_answer(transaction_id, &data);
-
-        // Check transaction ID is correctly padded
-        assert_eq!(response[0], 0x00);
-        assert_eq!(response[1], 0x01);
-    }
-
-    #[test]
     fn test_create_dns_packet_single_question() {
-        let transaction_id = 12345;
+        let transaction_id = 123;
         let payload = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
 
         let packet = create_dns_packet(transaction_id, &payload).unwrap();
@@ -781,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_create_dns_packet_multiple_questions() {
-        let transaction_id = 12345;
+        let transaction_id = 123;
         let payload = vec![1; MAX_DNS_FIRST_QNAME_SIZE + 1];
 
         let packet = create_dns_packet(transaction_id, &payload).unwrap();
@@ -795,7 +822,7 @@ mod tests {
 
     #[test]
     fn test_create_dns_packet_truncated() {
-        let transaction_id = 12345;
+        let transaction_id = 123;
         let payload = vec![1; MAX_DNS_PACKET_SIZE - DNS_HEADER_SIZE + 1];
 
         let packet = create_dns_packet(transaction_id, &payload);
@@ -804,7 +831,7 @@ mod tests {
 
     #[test]
     fn test_create_dns_packet_max_size() {
-        let transaction_id = 12345;
+        let transaction_id = 123;
         let payload = vec![1; MAX_PAYLOAD_SIZE];
 
         let packet = create_dns_packet(transaction_id, &payload).unwrap();
@@ -820,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_create_dns_packet_edge_cases() {
-        let transaction_id = 12345;
+        let transaction_id = 123;
         let empty_payload = vec![];
         let single_byte_payload = vec![1];
         let max_payload = vec![1; MAX_DNS_FIRST_QNAME_SIZE];
@@ -846,5 +873,127 @@ mod tests {
         let parsed = extract_dns_payload(&buf).unwrap();
         assert_eq!(parsed.transaction_id, transaction_id);
         assert_eq!(parsed.payload, max_payload);
+    }
+
+    #[test]
+    fn test_wrap_query_basic() {
+        let transaction_id = 0xAB;
+        let sequence_number = 0x01;
+        let query_data = vec![
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // 'example'
+            3, b'c', b'o', b'm', // 'com'
+            0,    // End of domain name
+            0x00, 0x01, // Type A
+            0x00, 0x01, // Class IN
+        ];
+
+        let expected = vec![
+            0xAB, 0x01, // Transaction ID
+            0x01, 0x00, // Flags (standard query)
+            0x00, 0x01, // Question count
+            0x00, 0x00, // Answer count
+            0x00, 0x00, // Authority record count
+            0x00, 0x00, // Additional record count
+            // Query data
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0x00, 0x00, 0x01,
+            0x00, 0x01,
+        ];
+
+        let result = wrap_query(transaction_id, sequence_number, &query_data);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_wrap_query_empty_data() {
+        let transaction_id = 0xAB;
+        let sequence_number = 0x01;
+        let query_data = vec![];
+
+        let expected = vec![
+            0xAB, 0x01, // Transaction ID
+            0x01, 0x00, // Flags (standard query)
+            0x00, 0x01, // Question count
+            0x00, 0x00, // Answer count
+            0x00, 0x00, // Authority record count
+            0x00, 0x00, // Additional record count
+        ];
+
+        let result = wrap_query(transaction_id, sequence_number, &query_data);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_wrap_query_custom_transaction_id() {
+        let transaction_id = 0xFF;
+        let sequence_number = 0x02;
+        let query_data = vec![
+            5, b'h', b'e', b'l', b'l', b'o', // 'hello'
+            0x00, // End of domain name
+            0x00, 0x01, // Type A
+            0x00, 0x01, // Class IN
+        ];
+
+        let expected = vec![
+            0xFF, 0x02, // Transaction ID
+            0x01, 0x00, // Flags (standard query)
+            0x00, 0x01, // Question count
+            0x00, 0x00, // Answer count
+            0x00, 0x00, // Authority record count
+            0x00, 0x00, // Additional record count
+            // Query data
+            5, b'h', b'e', b'l', b'l', b'o', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+
+        let result = wrap_query(transaction_id, sequence_number, &query_data);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_wrap_query_custom_sequence_number() {
+        let transaction_id = 0x01;
+        let sequence_number = 0xFF;
+        let query_data = vec![
+            3, b'w', b'w', b'w', // 'www'
+            6, b'g', b'o', b'o', b'g', b'l', b'e', // 'google'
+            0x00, // End of domain name
+            0x00, 0x01, // Type A
+            0x00, 0x01, // Class IN
+        ];
+
+        let expected = vec![
+            0x01, 0xFF, // Transaction ID
+            0x01, 0x00, // Flags (standard query)
+            0x00, 0x01, // Question count
+            0x00, 0x00, // Answer count
+            0x00, 0x00, // Authority record count
+            0x00, 0x00, // Additional record count
+            // Query data
+            3, b'w', b'w', b'w', 6, b'g', b'o', b'o', b'g', b'l', b'e', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+
+        let result = wrap_query(transaction_id, sequence_number, &query_data);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_wrap_query_edge_case() {
+        let transaction_id = 0x00;
+        let sequence_number = 0x00;
+        let query_data = vec![0x00]; // Minimum query data
+
+        let expected = vec![
+            0x00, 0x00, // Transaction ID
+            0x01, 0x00, // Flags (standard query)
+            0x00, 0x01, // Question count
+            0x00, 0x00, // Answer count
+            0x00, 0x00, // Authority record count
+            0x00, 0x00, // Additional record count
+            // Query data
+            0x00,
+        ];
+
+        let result = wrap_query(transaction_id, sequence_number, &query_data);
+        assert_eq!(result, expected);
     }
 }

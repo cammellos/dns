@@ -41,26 +41,24 @@ impl NetworkPacket<'_> {
         }
     }
 
-    fn set_id(v: &mut Vec<u8>) {
+    fn set_transaction_id_and_sequence_number(v: &mut Vec<u8>) {
         let mut rng = rand::thread_rng();
-        let mut num: u16;
+        let mut num: u8;
         loop {
             num = rng.gen();
             if num != 0 {
+                v.push(num);
                 break;
             }
         }
 
-        let bytes = num.to_be_bytes();
-
-        v.push(bytes[0]);
-        v.push(bytes[1]);
+        v.push(rng.gen());
     }
 
     pub fn to_network(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(MAX_DNS_PACKET_SIZE);
 
-        NetworkPacket::set_id(&mut result);
+        NetworkPacket::set_transaction_id_and_sequence_number(&mut result);
 
         // flags
         result.push(0x01); // set query bit

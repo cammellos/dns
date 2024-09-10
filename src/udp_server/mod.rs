@@ -1,25 +1,85 @@
+use log;
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+
 use crate::constants::{DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
 use crate::dns_parser::{
     extract_dns_payload, wrap_answer, ConnectionHeader, ConnectionInfo, ParsedData,
 };
-use log;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+
+struct PacketReceiver {
+    next_sequence_number: u8,
+    last_sequence_number: u8,
+    packets: HashMap<u8, TargetToClientPacket>,
+}
+
+impl PacketReceiver {
+    pub fn new(next_sequence_number: u8) -> PacketReceiver {
+        PacketReceiver {
+            next_sequence_number,
+            last_sequence_number: next_sequence_number,
+            packets: HashMap::new(),
+        }
+    }
+
+    pub fn process(&mut self, packet: TargetToClientPacket) -> Option<Vec<&TargetToClientPacket>> {
+        let mut sequence_number = packet.sequence_number;
+        log::debug!("processing packet: {}", packet.sequence_number);
+        let mut result = vec![];
+        self.add(packet);
+
+        if sequence_number > self.last_sequence_number {
+            log::debug!("setting last sequence number: {}", sequence_number);
+            self.last_sequence_number = sequence_number;
+        }
+        if sequence_number != self.next_sequence_number {
+            log::debug!(
+                "packet out of order: is {} expecting {}",
+                sequence_number,
+                self.next_sequence_number,
+            );
+            return None;
+        }
+        log::debug!("retrieving the rest of the packets");
+        while let Some(next_packet) = self.packets.get(&sequence_number) {
+            log::debug!(
+                "packet {} found, adding to result",
+                next_packet.sequence_number
+            );
+            sequence_number += 1;
+            result.push(next_packet);
+        }
+        self.next_sequence_number = sequence_number;
+        log::debug!("found all packets, increasing next sequence number");
+        return Some(result);
+    }
+
+    fn add(&mut self, packet: TargetToClientPacket) {
+        self.packets.insert(packet.sequence_number, packet);
+    }
+
+    fn get(&self, id: u8) -> Option<&TargetToClientPacket> {
+        self.packets.get(&id)
+    }
+
+    fn delete(&mut self, id: u8) {
+        self.packets.remove(&id);
+    }
+}
 
 struct ConnectionParams<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     client_target_stream: S,
-    transaction_id: u16,
+    transaction_id: u8,
+    initial_sequence_number: u8,
     connection_id: String,
-    target: ConnectionInfo,
     client_to_target_receiver: mpsc::Receiver<TargetToClientPacket>,
     target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
 }
@@ -31,6 +91,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     params: ConnectionParams<S>,
+    packet_receiver: PacketReceiver,
 }
 
 // 1) Wait on the tcp connection and send back
@@ -41,14 +102,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     pub fn new(params: ConnectionParams<S>) -> Self {
-        Self { params }
+        let next_sequence_number = params.initial_sequence_number + 1;
+        Self {
+            params,
+            packet_receiver: PacketReceiver::new(next_sequence_number),
+        }
     }
 
     pub async fn connect(
         target: ConnectionInfo,
         client_to_target_receiver: mpsc::Receiver<TargetToClientPacket>,
         target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
-        transaction_id: u16,
+        transaction_id: u8,
+        initial_sequence_number: u8,
         connection_id: String,
     ) -> Result<(), String> {
         match target.connect().await {
@@ -56,9 +122,9 @@ where
                 tokio::spawn(async move {
                     let params = ConnectionParams {
                         client_target_stream,
-                        target,
                         connection_id,
                         transaction_id,
+                        initial_sequence_number,
                         client_to_target_receiver,
                         target_to_client_sender,
                     };
@@ -84,10 +150,19 @@ where
                 message = self.params.client_to_target_receiver.recv() => {
                     log::debug!("received packet to forward to target");
                     if let Some(msg) = message {
-                        if let Err(e) = self.params.client_target_stream.write_all(&msg.data).await {
-                            log::error!("failed to write to stream: {}", e);
-                            return;
+                        let process_result = self.packet_receiver.process(msg);
+                        if process_result.is_none() {
+                            continue;
                         }
+
+                        for packet in process_result.unwrap() {
+                            if let Err(e) = self.params.client_target_stream.write_all(&packet.data).await {
+                                log::error!("failed to write to stream: {}", e);
+                                return;
+                            }
+
+                        }
+
                     } else {
                         // The sender has closed, end the connection
                         log::debug!("sender closed the channel, ending connection.");
@@ -99,9 +174,11 @@ where
                     Ok(n) if n > 0 => {
 
                         log::debug!("received: {} {}, passing back", String::from_utf8_lossy(&buffer[..n]), n);
+                        let sequence_number = 0x23;
                         let packet = TargetToClientPacket{
                             connection_id: self.params.connection_id.clone(),
-                            data: wrap_answer(self.params.transaction_id, &buffer[0..n]),
+                            sequence_number,
+                            data: wrap_answer(self.params.transaction_id, sequence_number, &buffer[0..n]),
                         };
                         self.params.target_to_client_sender.send(packet).await.unwrap();
                     }
@@ -129,13 +206,14 @@ where
 
 struct TargetToClientPacket {
     connection_id: String,
+    sequence_number: u8,
     data: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct Connection {
     client_to_target_sender: mpsc::Sender<TargetToClientPacket>,
-    transaction_id: u16,
+    transaction_id: u8,
     src: SocketAddr,
 }
 
@@ -172,7 +250,8 @@ pub struct UdpServer {
 enum Command {
     NewConnection {
         connection_id: String,
-        transaction_id: u16,
+        transaction_id: u8,
+        initial_sequence_number: u8,
         header: ConnectionHeader,
     },
     ExistingConnection {
@@ -180,7 +259,7 @@ enum Command {
     },
 }
 
-fn src_and_transaction_id_to_string(src: SocketAddr, transaction_id: u16) -> String {
+fn src_and_transaction_id_to_string(src: SocketAddr, transaction_id: u8) -> String {
     return format!("{}-{}", src.to_string(), transaction_id.to_string());
 }
 
@@ -210,6 +289,7 @@ impl UdpServer {
 
         let payload = parsed_data.payload;
         let transaction_id = parsed_data.transaction_id;
+        let initial_sequence_number = parsed_data.sequence_number;
         let connection_id = src_and_transaction_id_to_string(src, transaction_id);
 
         let connection_result = connection_manager.get(&connection_id);
@@ -228,6 +308,7 @@ impl UdpServer {
                 Ok(Command::NewConnection {
                     header,
                     connection_id,
+                    initial_sequence_number,
                     transaction_id,
                 })
             }
@@ -239,7 +320,8 @@ impl UdpServer {
         target: ConnectionInfo,
         client_to_target_receiver: mpsc::Receiver<TargetToClientPacket>,
         target_to_client_sender: mpsc::Sender<TargetToClientPacket>,
-        transaction_id: u16,
+        transaction_id: u8,
+        initial_sequence_number: u8,
         connection_id: String,
     ) {
         let connection_string = format!("target: {:?}", target);
@@ -251,6 +333,7 @@ impl UdpServer {
             client_to_target_receiver,
             target_to_client_sender,
             transaction_id,
+            initial_sequence_number,
             connection_id,
         )
         .await
@@ -276,6 +359,7 @@ impl UdpServer {
                         .client_to_target_sender
                         .send(TargetToClientPacket {
                             connection_id,
+                            sequence_number: buf[1],
                             data: buf[DNS_HEADER_SIZE..size].to_vec(),
                         })
                         .await
@@ -286,12 +370,12 @@ impl UdpServer {
             Ok(Command::NewConnection {
                 transaction_id,
                 connection_id,
+                initial_sequence_number,
                 header,
             }) => {
                 log::debug!("new connection: {}", connection_id);
                 let connection_id_copy = connection_id.clone();
                 let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
-                //let (target_to_client_sender, target_to_client_receiver) = mpsc::channel(32);
 
                 let connection = Connection {
                     transaction_id,
@@ -306,6 +390,7 @@ impl UdpServer {
                     client_to_target_receiver,
                     target_to_client_sender,
                     transaction_id,
+                    initial_sequence_number,
                     connection_id_copy,
                 ));
             }
@@ -372,26 +457,23 @@ impl UdpServer {
 
 #[cfg(test)]
 mod test {
-
-    use crate::constants::{DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
-    use crate::dns_parser::extract_dns_payload_from_answer;
-    use crate::dns_parser::ConnectionInfo;
-    use crate::network_packet::NetworkPacket;
-    use crate::udp_server::{
-        src_and_transaction_id_to_string, Command, Connection, ConnectionHandler,
-        ConnectionManager, ConnectionParams, TargetToClientPacket, UdpServer,
-    };
     use std::io::Error;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use test_log::test;
-    use tokio::io::AsyncRead;
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWrite;
-    use tokio::io::AsyncWriteExt;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
     use tokio_test::io::Builder;
+
+    use test_log::test;
+
+    use crate::dns_parser::{extract_dns_payload_from_answer, wrap_query, ConnectionInfo};
+    use crate::network_packet::NetworkPacket;
+    use crate::udp_server::{
+        src_and_transaction_id_to_string, Command, Connection, ConnectionHandler,
+        ConnectionManager, ConnectionParams, PacketReceiver, TargetToClientPacket, UdpServer,
+    };
 
     #[test(tokio::test)]
     async fn test_connection_handler_start() {
@@ -404,14 +486,10 @@ mod test {
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
 
-        let mock_target = ConnectionInfo::Ipv4 {
-            address: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-        };
         let params = ConnectionParams {
             client_target_stream,
-            target: mock_target,
             transaction_id: 1,
+            initial_sequence_number: 2,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -427,6 +505,7 @@ mod test {
         client_to_target_sender
             .send(TargetToClientPacket {
                 data: b"response1".to_vec(),
+                sequence_number: 3,
                 connection_id: "test".to_string(),
             })
             .await
@@ -463,14 +542,10 @@ mod test {
         let (_, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
 
-        let mock_target = ConnectionInfo::Ipv4 {
-            address: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-        };
         let params = ConnectionParams {
             client_target_stream,
-            target: mock_target,
             transaction_id: 1,
+            initial_sequence_number: 2,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -504,15 +579,10 @@ mod test {
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
 
-        let mock_target = ConnectionInfo::Ipv4 {
-            address: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-        };
-
         let params = ConnectionParams {
             client_target_stream,
-            target: mock_target,
             transaction_id: 1,
+            initial_sequence_number: 2,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -546,15 +616,10 @@ mod test {
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
 
-        let mock_target = ConnectionInfo::Ipv4 {
-            address: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-        };
-
         let params = ConnectionParams {
             client_target_stream,
-            target: mock_target,
             transaction_id: 1,
+            initial_sequence_number: 2,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -579,6 +644,7 @@ mod test {
         let _ = client_to_target_sender
             .send(TargetToClientPacket {
                 data: b"test".to_vec(),
+                sequence_number: 1,
                 connection_id: "test".to_string(),
             })
             .await;
@@ -593,15 +659,10 @@ mod test {
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
         drop(client_to_target_sender);
 
-        let mock_target = ConnectionInfo::Ipv4 {
-            address: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-        };
-
         let params = ConnectionParams {
             client_target_stream,
-            target: mock_target,
             transaction_id: 1,
+            initial_sequence_number: 2,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -633,15 +694,10 @@ mod test {
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
 
-        let mock_target = ConnectionInfo::Ipv4 {
-            address: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-        };
-
         let params = ConnectionParams {
             client_target_stream,
-            target: mock_target,
             transaction_id: 1,
+            initial_sequence_number: 2,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -707,7 +763,7 @@ mod test {
                 // Validate the server's response
                 match extract_dns_payload_from_answer(&buf[..size]) {
                     Some(parsed_data) => {
-                        assert_eq!(parsed_data.transaction_id, 258);
+                        assert_eq!(parsed_data.transaction_id, 1);
                         assert_eq!(parsed_data.payload, b"Hello, this is the server: 0");
                     }
                     None => panic!("data malformed"),
@@ -766,10 +822,11 @@ mod test {
             address: actual_address,
             port: actual_port,
         };
+        let initial_sequence_number = 0x03;
 
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
-        bytes[0] = 0x00;
-        bytes[1] = 0x02;
+        bytes[0] = 0x02;
+        bytes[1] = initial_sequence_number;
         let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         let result =
@@ -777,6 +834,7 @@ mod test {
         match result {
             Ok(Command::NewConnection {
                 transaction_id,
+                initial_sequence_number,
                 connection_id,
                 header,
             }) => {
@@ -806,12 +864,12 @@ mod test {
             port: actual_port,
         };
 
+        let transaction_id = 2;
+
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
-        bytes[0] = 0x00;
-        bytes[1] = 0x02;
+        bytes[0] = transaction_id;
         let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        let transaction_id = 2;
         let connection_id = src_and_transaction_id_to_string(socket, transaction_id);
         let (client_to_target_sender, _) = mpsc::channel(32);
 
@@ -946,7 +1004,7 @@ mod test {
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
         bytes[0] = 0x01;
         bytes[1] = 0x02;
-        let connection_id = format!("127.0.0.1:{}-258", actual_port);
+        let connection_id = format!("127.0.0.1:{}-1", actual_port);
 
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -963,7 +1021,7 @@ mod test {
             let data = received_data.data.as_slice();
             match extract_dns_payload_from_answer(data) {
                 Some(parsed_data) => {
-                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(parsed_data.transaction_id, 1);
                     assert_eq!(
                         "Hello, this is the server: 0",
                         String::from_utf8_lossy(&parsed_data.payload),
@@ -975,6 +1033,8 @@ mod test {
             panic!("Data was not sent to the existing connection");
         }
 
+        // increase sequence number
+        bytes[1] = 0x03;
         // send more data
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -992,7 +1052,7 @@ mod test {
             assert_eq!(received_data.connection_id, connection_id);
             match extract_dns_payload_from_answer(data) {
                 Some(parsed_data) => {
-                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(parsed_data.transaction_id, 1);
                     assert_eq!(
                         "Hello, this is the server: 1",
                         String::from_utf8_lossy(&parsed_data.payload),
@@ -1026,9 +1086,10 @@ mod test {
         };
 
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
-        bytes[0] = 0x01;
-        bytes[1] = 0x02;
-        let connection_id = format!("127.0.0.1:{}-258", actual_port);
+        let transaction_id = bytes[0];
+        let initial_sequence_number = 0x32;
+        bytes[1] = initial_sequence_number;
+        let connection_id = format!("127.0.0.1:{}-{}", actual_port, transaction_id);
 
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -1045,7 +1106,7 @@ mod test {
             let data = received_data.data.as_slice();
             match extract_dns_payload_from_answer(data) {
                 Some(parsed_data) => {
-                    assert_eq!(parsed_data.transaction_id, 258);
+                    assert_eq!(parsed_data.transaction_id, transaction_id);
                     assert_eq!(
                         "Hello, this is the server: 0",
                         String::from_utf8_lossy(&parsed_data.payload),
@@ -1057,18 +1118,8 @@ mod test {
             panic!("Data was not sent to the existing connection");
         }
 
-        let mut second_packet: Vec<u8> = vec![0; DNS_HEADER_SIZE + 10];
-
-        second_packet[DNS_HEADER_SIZE] = 0x00;
-        second_packet[DNS_HEADER_SIZE + 1] = 0x00;
-        second_packet[DNS_HEADER_SIZE + 2] = 0x00;
-        second_packet[DNS_HEADER_SIZE + 3] = 0x02;
-        second_packet[DNS_HEADER_SIZE + 4] = b's';
-        second_packet[DNS_HEADER_SIZE + 5] = b'e';
-        second_packet[DNS_HEADER_SIZE + 6] = b'c';
-        second_packet[DNS_HEADER_SIZE + 7] = b'o';
-        second_packet[DNS_HEADER_SIZE + 8] = b'n';
-        second_packet[DNS_HEADER_SIZE + 9] = b'd';
+        let second_packet: Vec<u8> =
+            wrap_query(transaction_id, initial_sequence_number + 2, b"second");
 
         // send more data
         UdpServer::handle_new_packet(
@@ -1081,22 +1132,128 @@ mod test {
         .await
         .unwrap();
 
+        let first_packet: Vec<u8> =
+            wrap_query(transaction_id, initial_sequence_number + 1, b"first");
+
+        // send more data
+        UdpServer::handle_new_packet(
+            &mut connection_manager,
+            &first_packet,
+            first_packet.len(),
+            src,
+            sender.clone(),
+        )
+        .await
+        .unwrap();
+
         // check that data is returned
         if let Some(received_data) = receiver.recv().await {
             let data = received_data.data.as_slice();
             assert_eq!(received_data.connection_id, connection_id);
             match extract_dns_payload_from_answer(data) {
                 Some(parsed_data) => {
-                    assert_eq!(parsed_data.transaction_id, 258);
-                    assert_eq!(
-                        "Hello, this is the server: 1",
-                        String::from_utf8_lossy(&parsed_data.payload),
-                    );
+                    assert_eq!(parsed_data.transaction_id, transaction_id);
+                    assert_eq!("firstsecond", String::from_utf8_lossy(&parsed_data.payload),);
                 }
                 None => panic!("data malformed"),
             };
         } else {
             panic!("Data was not sent to the existing connection");
         }
+    }
+
+    #[test]
+    fn test_packet_receiver_basic_operations() {
+        let sequence_number = 0x02;
+
+        let mut packet_receiver = PacketReceiver::new(sequence_number + 1);
+
+        match packet_receiver.get(sequence_number) {
+            Some(_) => panic!("should not be getting anything"),
+            _ => {}
+        }
+
+        let packet = TargetToClientPacket {
+            data: b"test".to_vec(),
+            sequence_number,
+            connection_id: "test".to_string(),
+        };
+
+        packet_receiver.add(packet);
+
+        match packet_receiver.get(sequence_number) {
+            Some(connection) => {
+                assert_eq!(connection.sequence_number, sequence_number);
+            }
+            _ => panic!("it should retrieve the record"),
+        }
+
+        packet_receiver.delete(sequence_number);
+
+        match packet_receiver.get(sequence_number) {
+            Some(_) => panic!("should not be getting anything"),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_packet_receiver_out_of_order() {
+        let sequence_number_1 = 0x01;
+        let sequence_number_2 = 0x02;
+        let sequence_number_3 = 0x03;
+        let connection_id = "test".to_string();
+
+        let mut packet_receiver = PacketReceiver::new(sequence_number_1);
+
+        let packet_1 = TargetToClientPacket {
+            data: b"test-1".to_vec(),
+            sequence_number: sequence_number_1,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_2 = TargetToClientPacket {
+            data: b"test-2".to_vec(),
+            sequence_number: sequence_number_2,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_3 = TargetToClientPacket {
+            data: b"test-3".to_vec(),
+            sequence_number: sequence_number_3,
+            connection_id: connection_id.clone(),
+        };
+
+        let result = packet_receiver.process(packet_3);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 1);
+        assert_eq!(packet_receiver.last_sequence_number, 3);
+
+        let result = packet_receiver.process(packet_2);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 1);
+        assert_eq!(packet_receiver.last_sequence_number, 3);
+
+        let result = packet_receiver.process(packet_1);
+        assert!(result.is_some());
+
+        let packets = result.unwrap();
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].sequence_number, 1);
+        assert_eq!(packets[1].sequence_number, 2);
+        assert_eq!(packets[2].sequence_number, 3);
+
+        let sequence_number_4 = 4;
+        let packet_4 = TargetToClientPacket {
+            data: b"test-4".to_vec(),
+            sequence_number: sequence_number_4,
+            connection_id: connection_id.clone(),
+        };
+
+        let result = packet_receiver.process(packet_4);
+        assert!(result.is_some());
+        let actual_packets = result.unwrap();
+        assert_eq!(actual_packets.len(), 1);
+        assert_eq!(actual_packets[0].sequence_number, 4);
     }
 }
