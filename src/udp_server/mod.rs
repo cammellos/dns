@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::constants::{DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
 use crate::dns_parser::{
-    extract_dns_payload, wrap_answer, ConnectionHeader, ConnectionInfo, ParsedData,
+    extract_dns_payload, wrap_ack, wrap_answer, ConnectionHeader, ConnectionInfo, ParsedData,
 };
 
 struct PacketReceiver {
@@ -148,22 +148,30 @@ where
             let mut buffer = vec![0u8; 512];
             tokio::select! {
                 message = self.params.client_to_target_receiver.recv() => {
-                    log::debug!("received packet to forward to target");
+                log::debug!("received packet to forward to target");
                     if let Some(msg) = message {
+                        let ack = TargetToClientPacket{
+                            connection_id: self.params.connection_id.clone(),
+                            sequence_number: msg.sequence_number,
+                            data: wrap_ack(self.params.transaction_id, msg.sequence_number),
+                        };
                         let process_result = self.packet_receiver.process(msg);
-                        if process_result.is_none() {
-                            continue;
+                    log::debug!("acking packet: {}", ack.sequence_number);
+                    self.params.target_to_client_sender.send(ack).await.unwrap();
+
+                    if process_result.is_none() {
+                        continue;
+                    }
+
+                    for packet in process_result.unwrap() {
+                        if let Err(e) = self.params.client_target_stream.write_all(&packet.data).await {
+                            log::error!("failed to write to stream: {}", e);
+                            return;
                         }
 
-                        for packet in process_result.unwrap() {
-                            if let Err(e) = self.params.client_target_stream.write_all(&packet.data).await {
-                                log::error!("failed to write to stream: {}", e);
-                                return;
-                            }
+                    }
 
-                        }
-
-                    } else {
+                } else {
                         // The sender has closed, end the connection
                         log::debug!("sender closed the channel, ending connection.");
                         return;
@@ -457,6 +465,7 @@ impl UdpServer {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
     use std::io::Error;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -468,7 +477,7 @@ mod test {
 
     use test_log::test;
 
-    use crate::dns_parser::{extract_dns_payload_from_answer, wrap_query, ConnectionInfo};
+    use crate::dns_parser::{extract_dns_payload_from_answer, is_ack, wrap_query, ConnectionInfo};
     use crate::network_packet::NetworkPacket;
     use crate::udp_server::{
         src_and_transaction_id_to_string, Command, Connection, ConnectionHandler,
@@ -485,11 +494,13 @@ mod test {
 
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
+        let transaction_id = 1;
+        let initial_sequence_number = 2;
 
         let params = ConnectionParams {
             client_target_stream,
-            transaction_id: 1,
-            initial_sequence_number: 2,
+            transaction_id,
+            initial_sequence_number,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -505,21 +516,53 @@ mod test {
         client_to_target_sender
             .send(TargetToClientPacket {
                 data: b"response1".to_vec(),
-                sequence_number: 3,
+                sequence_number: initial_sequence_number + 1,
                 connection_id: "test".to_string(),
             })
             .await
             .unwrap();
 
-        if let Some(received) = target_to_client_receiver.recv().await {
-            let data = received.data.as_slice();
-            assert_eq!(
-                extract_dns_payload_from_answer(data).unwrap().payload,
-                b"hello".to_vec()
-            );
-        } else {
-            panic!("Did not receive expected data");
+        let mut received_packets = HashSet::new();
+
+        // Collect the two packets
+        for _ in 0..2 {
+            if let Some(received) = target_to_client_receiver.recv().await {
+                received_packets.insert(received.data);
+            } else {
+                panic!("Did not receive expected data");
+            }
         }
+
+        let mut found_payload = false;
+        let mut found_ack = false;
+
+        // Now that we have both packets, we can process them
+        for data in received_packets.iter() {
+            let data_slice = data.as_slice();
+            if is_ack(&data_slice) {
+                // Ensure only one ACK packet is received
+                assert!(!found_ack, "Received duplicate ACK packet");
+                found_ack = true;
+
+                // Check the ACK packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(data_slice[1], initial_sequence_number + 1);
+            } else if let Some(payload) = extract_dns_payload_from_answer(data_slice) {
+                // Ensure only one payload packet is received
+                assert!(!found_payload, "Received duplicate payload packet");
+                found_payload = true;
+
+                // Check the payload packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(payload.payload, b"hello".to_vec());
+            } else {
+                panic!("Unexpected packet content");
+            }
+        }
+
+        // Ensure we received exactly one payload and one ACK
+        assert!(found_payload, "Did not receive expected payload packet");
+        assert!(found_ack, "Did not receive expected ACK packet");
 
         if let Some(received) = target_to_client_receiver.recv().await {
             let data = received.data.as_slice();
@@ -984,6 +1027,8 @@ mod test {
     #[test(tokio::test)]
     async fn test_handle_socket_data_new_connection() {
         let tcp_server_result = start_tcp_test_server(false).await;
+        let transaction_id = 0x01;
+        let initial_sequence_number = 0x02;
         assert!(tcp_server_result.is_ok(), "failed to start the server");
 
         let tcp_addr = tcp_server_result.unwrap();
@@ -1002,8 +1047,8 @@ mod test {
         };
 
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
-        bytes[0] = 0x01;
-        bytes[1] = 0x02;
+        bytes[0] = transaction_id;
+        bytes[1] = initial_sequence_number;
         let connection_id = format!("127.0.0.1:{}-1", actual_port);
 
         UdpServer::handle_new_packet(
@@ -1034,7 +1079,7 @@ mod test {
         }
 
         // increase sequence number
-        bytes[1] = 0x03;
+        bytes[1] = initial_sequence_number + 1;
         // send more data
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -1046,23 +1091,47 @@ mod test {
         .await
         .unwrap();
 
-        // check that data is returned
-        if let Some(received_data) = receiver.recv().await {
-            let data = received_data.data.as_slice();
-            assert_eq!(received_data.connection_id, connection_id);
-            match extract_dns_payload_from_answer(data) {
-                Some(parsed_data) => {
-                    assert_eq!(parsed_data.transaction_id, 1);
-                    assert_eq!(
-                        "Hello, this is the server: 1",
-                        String::from_utf8_lossy(&parsed_data.payload),
-                    );
-                }
-                None => panic!("data malformed"),
-            };
-        } else {
-            panic!("Data was not sent to the existing connection");
+        let mut received_packets = HashSet::new();
+
+        // Collect the two packets
+        for _ in 0..2 {
+            if let Some(received) = receiver.recv().await {
+                received_packets.insert(received.data);
+            } else {
+                panic!("Did not receive expected data");
+            }
         }
+
+        let mut found_payload = false;
+        let mut found_ack = false;
+
+        // Now that we have both packets, we can process them
+        for data in received_packets.iter() {
+            let data_slice = data.as_slice();
+            if is_ack(&data_slice) {
+                // Ensure only one ACK packet is received
+                assert!(!found_ack, "Received duplicate ACK packet");
+                found_ack = true;
+
+                // Check the ACK packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(data_slice[1], initial_sequence_number + 1);
+            } else if let Some(payload) = extract_dns_payload_from_answer(data_slice) {
+                // Ensure only one payload packet is received
+                assert!(!found_payload, "Received duplicate payload packet");
+                found_payload = true;
+
+                // Check the payload packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(payload.payload, b"Hello, this is the server: 1".to_vec());
+            } else {
+                panic!("Unexpected packet content");
+            }
+        }
+
+        // Ensure we received exactly one payload and one ACK
+        assert!(found_payload, "Did not receive expected payload packet");
+        assert!(found_ack, "Did not receive expected ACK packet");
     }
 
     #[test(tokio::test)]
@@ -1146,20 +1215,58 @@ mod test {
         .await
         .unwrap();
 
-        // check that data is returned
-        if let Some(received_data) = receiver.recv().await {
-            let data = received_data.data.as_slice();
-            assert_eq!(received_data.connection_id, connection_id);
-            match extract_dns_payload_from_answer(data) {
-                Some(parsed_data) => {
-                    assert_eq!(parsed_data.transaction_id, transaction_id);
-                    assert_eq!("firstsecond", String::from_utf8_lossy(&parsed_data.payload),);
-                }
-                None => panic!("data malformed"),
-            };
-        } else {
-            panic!("Data was not sent to the existing connection");
+        let mut received_packets = HashSet::new();
+
+        // Collect the two packets
+        for _ in 0..3 {
+            if let Some(received) = receiver.recv().await {
+                received_packets.insert(received.data);
+            } else {
+                panic!("Did not receive expected data");
+            }
         }
+
+        let mut found_payload = false;
+        let mut found_ack_1 = false;
+        let mut found_ack_2 = false;
+
+        // Now that we have both packets, we can process them
+        for data in received_packets.iter() {
+            let data_slice = data.as_slice();
+            if is_ack(&data_slice) && data_slice[1] == initial_sequence_number + 1 {
+                // Ensure only one ACK packet is received
+                assert!(!found_ack_1, "Received duplicate ACK packet");
+                found_ack_1 = true;
+
+                // Check the ACK packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(data_slice[1], initial_sequence_number + 1);
+            } else if is_ack(&data_slice) && data_slice[1] == initial_sequence_number + 2 {
+                // Ensure only one ACK packet is received
+                assert!(!found_ack_2, "Received duplicate ACK packet");
+                found_ack_2 = true;
+
+                // Check the ACK packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(data_slice[1], initial_sequence_number + 2);
+            } else if let Some(payload) = extract_dns_payload_from_answer(data_slice) {
+                // Ensure only one payload packet is received
+                assert!(!found_payload, "Received duplicate payload packet");
+                found_payload = true;
+
+                // Check the payload packet
+                assert_eq!(data_slice[0], transaction_id);
+                assert_eq!(payload.transaction_id, transaction_id);
+                assert_eq!("firstsecond", String::from_utf8_lossy(&payload.payload),);
+            } else {
+                panic!("Unexpected packet content");
+            }
+        }
+
+        // Ensure we received exactly one payload and one ACK
+        assert!(found_payload, "Did not receive expected payload packet");
+        assert!(found_ack_1, "Did not receive expected ACK 1 packet");
+        assert!(found_ack_2, "Did not receive expected ACK 2 packet");
     }
 
     #[test]

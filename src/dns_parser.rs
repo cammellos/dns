@@ -1,7 +1,8 @@
 use crate::constants::{
-    DNS_HEADER_SIZE, DNS_QNAME_METADATA_SIZE, DNS_TYPE_CLASS_SIZE, MAX_DNS_FIRST_QNAME_SIZE,
-    MAX_DNS_PACKET_SIZE, MAX_DNS_SECOND_QNAME_SIZE, MAX_PAYLOAD_SIZE,
-    NETWORK_ADDRESS_TYPE_DOMAIN_NAME, NETWORK_ADDRESS_TYPE_IPV4, NETWORK_ADDRESS_TYPE_IPV6,
+    DNS_HEADER_ACK_BIT, DNS_HEADER_ACK_BYTE, DNS_HEADER_SIZE, DNS_QNAME_METADATA_SIZE,
+    DNS_TYPE_CLASS_SIZE, MAX_DNS_FIRST_QNAME_SIZE, MAX_DNS_PACKET_SIZE, MAX_DNS_SECOND_QNAME_SIZE,
+    MAX_PAYLOAD_SIZE, NETWORK_ADDRESS_TYPE_DOMAIN_NAME, NETWORK_ADDRESS_TYPE_IPV4,
+    NETWORK_ADDRESS_TYPE_IPV6,
 };
 use crate::errors::not_implemented;
 use std::net::Ipv4Addr;
@@ -37,6 +38,35 @@ pub struct ParsedData {
     pub payload: Vec<u8>,
 }
 
+pub fn wrap_ack(transaction_id: u8, sequence_number: u8) -> Vec<u8> {
+    let mut response = Vec::with_capacity(DNS_HEADER_SIZE); // Reserve space for header + data
+
+    response.push(transaction_id); // High byte
+    response.push(sequence_number); // Low byte
+
+    // DNS header flags for a standard response (e.g., 0x8180)
+    response.push(0x81); // Response flag (QR = 1, opcode = 0000, AA = 1, TC = 0, RD = 1)
+    response.push(0x80); // RA = 1, Z = 000, RCODE = 0000 (no error)
+
+    // Question count (set to 1, since this is a response to a query)
+    response.push(0x00);
+    response.push(0x01);
+
+    // Answer count (set to 1, assuming there's 1 answer)
+    response.push(0x00);
+    response.push(0x00);
+
+    // Authority record count (set to 0)
+    response.push(0x00);
+    response.push(0x00);
+
+    // Additional record count (set to 0)
+    response.push(0x00);
+    response.push(0x00);
+
+    response
+}
+
 pub fn wrap_answer(transaction_id: u8, sequence_number: u8, data: &[u8]) -> Vec<u8> {
     let mut response = Vec::with_capacity(12 + data.len()); // Reserve space for header + data
 
@@ -44,7 +74,7 @@ pub fn wrap_answer(transaction_id: u8, sequence_number: u8, data: &[u8]) -> Vec<
     response.push(sequence_number); // Low byte
 
     // DNS header flags for a standard response (e.g., 0x8180)
-    response.push(0x81); // Response flag (QR = 1, opcode = 0000, AA = 1, TC = 0, RD = 1)
+    response.push(0x80); // Response flag (QR = 1, opcode = 0000, AA = 1, TC = 0, RD = 0)
     response.push(0x80); // RA = 1, Z = 000, RCODE = 0000 (no error)
 
     // Question count (set to 1, since this is a response to a query)
@@ -415,6 +445,10 @@ impl ConnectionHeader {
     }
 }
 
+pub fn is_ack(data: &[u8]) -> bool {
+    return data[DNS_HEADER_ACK_BYTE] & DNS_HEADER_ACK_BIT == 0x01;
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -694,8 +728,8 @@ mod tests {
         assert_eq!(response[0], 0x12);
         assert_eq!(response[1], 0x34);
 
-        // Check the flags (0x8180)
-        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        // Check the flags (0x8080)
+        assert_eq!(response[2], 0x80); // QR = 1, AA = 1, RD = 0
         assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
 
         // Check question count (0x0001)
@@ -729,8 +763,8 @@ mod tests {
         assert_eq!(response[0], 0x56);
         assert_eq!(response[1], 0x78);
 
-        // Check the flags (0x8180)
-        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        // Check the flags (0x8080)
+        assert_eq!(response[2], 0x80); // QR = 1, AA = 1, RD = 0
         assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
 
         // Check question count (0x0001)
@@ -768,8 +802,8 @@ mod tests {
         assert_eq!(response[0], 0x9A);
         assert_eq!(response[1], 0xBC);
 
-        // Check the flags (0x8180)
-        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        // Check the flags (0x8080)
+        assert_eq!(response[2], 0x80); // QR = 1, AA = 1, RD = 0
         assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
 
         // Check question count (0x0001)
@@ -995,5 +1029,49 @@ mod tests {
 
         let result = wrap_query(transaction_id, sequence_number, &query_data);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_wrap_ack() {
+        let transaction_id = 0x12;
+        let sequence_number = 0x34;
+
+        let response = wrap_ack(transaction_id, sequence_number);
+
+        // Check response length: 12 bytes for header + 0 bytes for data
+        assert_eq!(response.len(), 12);
+
+        // Check the transaction ID (0x12)
+        assert_eq!(response[0], 0x12);
+        assert_eq!(response[1], 0x34);
+
+        // Check the flags (0x8180)
+        assert_eq!(response[2], 0x81); // QR = 1, AA = 1, RD = 1
+        assert_eq!(response[3], 0x80); // RA = 1, RCODE = 0000
+
+        // Check question count (0x0001)
+        assert_eq!(response[4], 0x00);
+        assert_eq!(response[5], 0x01);
+
+        // Check answer count (0x0001)
+        assert_eq!(response[6], 0x00);
+        assert_eq!(response[7], 0x00);
+
+        // Check authority record count (0x0000)
+        assert_eq!(response[8], 0x00);
+        assert_eq!(response[9], 0x00);
+
+        // Check additional record count (0x0000)
+        assert_eq!(response[10], 0x00);
+        assert_eq!(response[11], 0x00);
+    }
+
+    #[test]
+    fn test_is_ack() {
+        let non_ack = [0x1, 0x2, 0x0, 0x4];
+        assert!(!is_ack(&non_ack));
+
+        let ack = [0x1, 0x2, 0x1, 0x4];
+        assert!(is_ack(&ack));
     }
 }
