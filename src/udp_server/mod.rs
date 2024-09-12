@@ -144,6 +144,18 @@ where
             "starting connection handler: {}",
             self.params.transaction_id
         );
+        // Acknowledge the initial packet
+        let ack = TargetToClientPacket {
+            connection_id: self.params.connection_id.clone(),
+            sequence_number: self.params.initial_sequence_number,
+            data: wrap_ack(
+                self.params.transaction_id,
+                self.params.initial_sequence_number,
+            ),
+        };
+        log::debug!("acking inital connection: {}", ack.sequence_number);
+        self.params.target_to_client_sender.send(ack).await.unwrap();
+
         loop {
             let mut buffer = vec![0u8; 512];
             tokio::select! {
@@ -512,6 +524,13 @@ mod test {
             handler.start().await;
         });
 
+        if let Some(received) = target_to_client_receiver.recv().await {
+            assert!(is_ack(&received.data));
+            assert_eq!(received.data[1], initial_sequence_number);
+        } else {
+            panic!("Did not receive expected data");
+        }
+
         // Simulate sending data to the target
         client_to_target_sender
             .send(TargetToClientPacket {
@@ -584,11 +603,12 @@ mod test {
 
         let (_, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
+        let initial_sequence_number = 2;
 
         let params = ConnectionParams {
             client_target_stream,
             transaction_id: 1,
-            initial_sequence_number: 2,
+            initial_sequence_number,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -599,6 +619,13 @@ mod test {
         let _handler_future = tokio::spawn(async move {
             handler.start().await;
         });
+
+        if let Some(received_data) = target_to_client_receiver.recv().await {
+            let data = received_data.data.as_slice();
+            assert!(is_ack(data));
+        } else {
+            panic!("Data was not sent to the existing connection");
+        }
 
         if let Some(received) = target_to_client_receiver.recv().await {
             panic!(
@@ -637,6 +664,14 @@ mod test {
             handler.start().await;
         });
 
+        // check that data is returned
+        if let Some(received_data) = target_to_client_receiver.recv().await {
+            let data = received_data.data.as_slice();
+            assert!(is_ack(data));
+        } else {
+            panic!("Data was not sent to the existing connection");
+        }
+
         if let Some(received) = target_to_client_receiver.recv().await {
             panic!(
                 "received some data while we should not: {:?}",
@@ -658,11 +693,12 @@ mod test {
 
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
+        let initial_sequence_number = 2;
 
         let params = ConnectionParams {
             client_target_stream,
             transaction_id: 1,
-            initial_sequence_number: 2,
+            initial_sequence_number,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -673,6 +709,14 @@ mod test {
         tokio::spawn(async move {
             handler.start().await;
         });
+
+        if let Some(received) = target_to_client_receiver.recv().await {
+            let data = received.data.as_slice();
+            assert!(is_ack(data));
+            assert_eq!(data[1], initial_sequence_number);
+        } else {
+            panic!("interrupted error should continue reading");
+        }
 
         if let Some(received) = target_to_client_receiver.recv().await {
             let data = received.data.as_slice();
@@ -700,12 +744,13 @@ mod test {
 
         let (client_to_target_sender, client_to_target_receiver) = mpsc::channel(32);
         let (target_to_client_sender, mut target_to_client_receiver) = mpsc::channel(32);
+        let initial_sequence_number = 2;
         drop(client_to_target_sender);
 
         let params = ConnectionParams {
             client_target_stream,
             transaction_id: 1,
-            initial_sequence_number: 2,
+            initial_sequence_number,
             connection_id: "test".to_string(),
             client_to_target_receiver,
             target_to_client_sender,
@@ -715,6 +760,14 @@ mod test {
         tokio::spawn(async move {
             handler.start().await;
         });
+
+        if let Some(received) = target_to_client_receiver.recv().await {
+            let data = received.data.as_slice();
+            assert!(is_ack(data));
+            assert_eq!(data[1], initial_sequence_number);
+        } else {
+            panic!("interrupted error should continue reading");
+        }
 
         // we wait, but it should stop as the channel is dropped
         if let Some(_) = target_to_client_receiver.recv().await {
@@ -773,10 +826,11 @@ mod test {
             address: actual_address,
             port: actual_port,
         };
+        let initial_sequence_number = 0x02;
 
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
         bytes[0] = 0x01;
-        bytes[1] = 0x02;
+        bytes[1] = initial_sequence_number;
 
         // Start the UDP server
         let server = UdpServer::new().await;
@@ -796,6 +850,18 @@ mod test {
 
         // Prepare a buffer to receive the server's response
         let mut buf = [0u8; 512];
+
+        let response = timeout(Duration::from_secs(2), client_socket.recv_from(&mut buf)).await;
+
+        match response {
+            Ok(Ok((size, _))) => {
+                // Validate the server's response
+                assert!(is_ack(&buf[..size]));
+                assert_eq!(buf[1], initial_sequence_number);
+            }
+            Ok(Err(e)) => panic!("Failed to receive data: {}", e),
+            Err(_) => panic!("Test timed out waiting for response"),
+        }
 
         // Receive the response from the server
         // Use a timeout to avoid hanging indefinitely if something goes wrong
@@ -1049,7 +1115,6 @@ mod test {
         let mut bytes = NetworkPacket::from_connection_info(&target).to_network();
         bytes[0] = transaction_id;
         bytes[1] = initial_sequence_number;
-        let connection_id = format!("127.0.0.1:{}-1", actual_port);
 
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -1060,6 +1125,14 @@ mod test {
         )
         .await
         .unwrap();
+
+        if let Some(received) = receiver.recv().await {
+            let data = received.data.as_slice();
+            assert!(is_ack(data));
+            assert_eq!(data[1], initial_sequence_number);
+        } else {
+            panic!("interrupted error should continue reading");
+        }
 
         // check that data is returned
         if let Some(received_data) = receiver.recv().await {
@@ -1158,7 +1231,6 @@ mod test {
         let transaction_id = bytes[0];
         let initial_sequence_number = 0x32;
         bytes[1] = initial_sequence_number;
-        let connection_id = format!("127.0.0.1:{}-{}", actual_port, transaction_id);
 
         UdpServer::handle_new_packet(
             &mut connection_manager,
@@ -1169,6 +1241,16 @@ mod test {
         )
         .await
         .unwrap();
+
+        // check that data is returned
+        if let Some(received_data) = receiver.recv().await {
+            let data = received_data.data.as_slice();
+            assert!(is_ack(data));
+            assert_eq!(data[0], transaction_id);
+            assert_eq!(data[1], initial_sequence_number);
+        } else {
+            panic!("Data was not sent to the existing connection");
+        }
 
         // check that data is returned
         if let Some(received_data) = receiver.recv().await {
