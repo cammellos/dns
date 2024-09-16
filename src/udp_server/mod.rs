@@ -7,27 +7,55 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::constants::{DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
+use crate::constants::{DEFAULT_WINDOW_SIZE, DNS_HEADER_SIZE, MAX_DNS_PACKET_SIZE};
 use crate::dns_parser::{
     extract_dns_payload, wrap_ack, wrap_answer, ConnectionHeader, ConnectionInfo, ParsedData,
 };
 
 struct PacketReceiver {
+    window_size: u8,
     next_sequence_number: u8,
     last_sequence_number: u8,
     packets: HashMap<u8, TargetToClientPacket>,
 }
 
 impl PacketReceiver {
-    pub fn new(next_sequence_number: u8) -> PacketReceiver {
+    pub fn new(next_sequence_number: u8, window_size: u8) -> PacketReceiver {
         PacketReceiver {
+            window_size,
             next_sequence_number,
             last_sequence_number: next_sequence_number,
             packets: HashMap::new(),
         }
     }
 
+    fn seq_num_in_window(sequence_number: u8, window_start: u8, window_size: u8) -> bool {
+        log::debug!(
+            "checking, window_start: {}, seq_num: {}, window_size: {}, wrapping: {}, result: {}",
+            window_start,
+            sequence_number,
+            window_size,
+            sequence_number.wrapping_sub(window_start),
+            sequence_number.wrapping_sub(window_start) < window_size,
+        );
+        sequence_number.wrapping_sub(window_start) < window_size
+    }
+
+    pub fn processed(&mut self, sequence_numbers: Vec<u8>) {
+        for sequence_number in sequence_numbers {
+            self.packets.remove(&sequence_number);
+        }
+    }
+
     pub fn process(&mut self, packet: TargetToClientPacket) -> Option<Vec<&TargetToClientPacket>> {
+        if !Self::seq_num_in_window(
+            packet.sequence_number,
+            self.next_sequence_number,
+            self.window_size,
+        ) {
+            return None;
+        }
+
         let mut sequence_number = packet.sequence_number;
         log::debug!("processing packet: {}", packet.sequence_number);
         let mut result = vec![];
@@ -51,7 +79,7 @@ impl PacketReceiver {
                 "packet {} found, adding to result",
                 next_packet.sequence_number
             );
-            sequence_number += 1;
+            sequence_number = sequence_number.wrapping_add(1);
             result.push(next_packet);
         }
         self.next_sequence_number = sequence_number;
@@ -105,7 +133,7 @@ where
         let next_sequence_number = params.initial_sequence_number + 1;
         Self {
             params,
-            packet_receiver: PacketReceiver::new(next_sequence_number),
+            packet_receiver: PacketReceiver::new(next_sequence_number, DEFAULT_WINDOW_SIZE),
         }
     }
 
@@ -161,13 +189,13 @@ where
             tokio::select! {
                 message = self.params.client_to_target_receiver.recv() => {
                 log::debug!("received packet to forward to target");
-                    if let Some(msg) = message {
+                   if let Some(msg) = message {
                         let ack = TargetToClientPacket{
                             connection_id: self.params.connection_id.clone(),
                             sequence_number: msg.sequence_number,
                             data: wrap_ack(self.params.transaction_id, msg.sequence_number),
-                        };
-                        let process_result = self.packet_receiver.process(msg);
+                   };
+                   let process_result = self.packet_receiver.process(msg);
                     log::debug!("acking packet: {}", ack.sequence_number);
                     self.params.target_to_client_sender.send(ack).await.unwrap();
 
@@ -175,13 +203,18 @@ where
                         continue;
                     }
 
-                    for packet in process_result.unwrap() {
+                    let packets = process_result.unwrap();
+                    let mut processed_packets = Vec::with_capacity(packets.len());
+                    for packet in packets {
                         if let Err(e) = self.params.client_target_stream.write_all(&packet.data).await {
                             log::error!("failed to write to stream: {}", e);
                             return;
                         }
+                        processed_packets.push(packet.sequence_number);
 
                     }
+
+                    self.packet_receiver.processed(processed_packets);
 
                 } else {
                         // The sender has closed, end the connection
@@ -489,6 +522,7 @@ mod test {
 
     use test_log::test;
 
+    use crate::constants::DEFAULT_WINDOW_SIZE;
     use crate::dns_parser::{extract_dns_payload_from_answer, is_ack, wrap_query, ConnectionInfo};
     use crate::network_packet::NetworkPacket;
     use crate::udp_server::{
@@ -1355,7 +1389,7 @@ mod test {
     fn test_packet_receiver_basic_operations() {
         let sequence_number = 0x02;
 
-        let mut packet_receiver = PacketReceiver::new(sequence_number + 1);
+        let mut packet_receiver = PacketReceiver::new(sequence_number + 1, DEFAULT_WINDOW_SIZE);
 
         match packet_receiver.get(sequence_number) {
             Some(_) => panic!("should not be getting anything"),
@@ -1392,7 +1426,7 @@ mod test {
         let sequence_number_3 = 0x03;
         let connection_id = "test".to_string();
 
-        let mut packet_receiver = PacketReceiver::new(sequence_number_1);
+        let mut packet_receiver = PacketReceiver::new(sequence_number_1, DEFAULT_WINDOW_SIZE);
 
         let packet_1 = TargetToClientPacket {
             data: b"test-1".to_vec(),
@@ -1444,5 +1478,209 @@ mod test {
         let actual_packets = result.unwrap();
         assert_eq!(actual_packets.len(), 1);
         assert_eq!(actual_packets[0].sequence_number, 4);
+
+        packet_receiver.processed(vec![
+            sequence_number_1,
+            sequence_number_2,
+            sequence_number_3,
+            sequence_number_4,
+        ]);
+
+        assert!(packet_receiver.get(sequence_number_1).is_none());
+        assert!(packet_receiver.get(sequence_number_2).is_none());
+        assert!(packet_receiver.get(sequence_number_3).is_none());
+        assert!(packet_receiver.get(sequence_number_4).is_none());
+    }
+
+    #[test]
+    fn test_packet_receiver_outside_window() {
+        let sequence_number_1 = 0x01;
+        let sequence_number_2 = 0x02;
+        let sequence_number_3 = 0x03;
+        let connection_id = "test".to_string();
+
+        let mut packet_receiver = PacketReceiver::new(sequence_number_1, 3);
+
+        let packet_1 = TargetToClientPacket {
+            data: b"test-1".to_vec(),
+            sequence_number: sequence_number_1,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_2 = TargetToClientPacket {
+            data: b"test-2".to_vec(),
+            sequence_number: sequence_number_2,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_3 = TargetToClientPacket {
+            data: b"test-3".to_vec(),
+            sequence_number: sequence_number_3,
+            connection_id: connection_id.clone(),
+        };
+
+        let sequence_number_4 = 4;
+        let packet_4 = TargetToClientPacket {
+            data: b"test-4".to_vec(),
+            sequence_number: sequence_number_4,
+            connection_id: connection_id.clone(),
+        };
+
+        let result = packet_receiver.process(packet_4);
+        assert!(result.is_none());
+
+        let result = packet_receiver.process(packet_3);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 1);
+        assert_eq!(packet_receiver.last_sequence_number, 3);
+
+        let result = packet_receiver.process(packet_2);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 1);
+        assert_eq!(packet_receiver.last_sequence_number, 3);
+
+        let result = packet_receiver.process(packet_1);
+        assert!(result.is_some());
+
+        let packets = result.unwrap();
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].sequence_number, 1);
+        assert_eq!(packets[1].sequence_number, 2);
+        assert_eq!(packets[2].sequence_number, 3);
+
+        packet_receiver.processed(vec![
+            sequence_number_1,
+            sequence_number_2,
+            sequence_number_3,
+        ]);
+
+        assert!(packet_receiver.get(sequence_number_1).is_none());
+        assert!(packet_receiver.get(sequence_number_2).is_none());
+        assert!(packet_receiver.get(sequence_number_3).is_none());
+        assert!(packet_receiver.get(sequence_number_4).is_none());
+    }
+
+    #[test]
+    fn test_packet_receiver_inside_window_wrapping() {
+        let sequence_number_1 = 0xff;
+        let sequence_number_2 = 0x00;
+        let sequence_number_3 = 0x01;
+        let sequence_number_4 = 0x02;
+        let connection_id = "test".to_string();
+
+        let mut packet_receiver = PacketReceiver::new(sequence_number_1, 0x03);
+
+        let packet_1 = TargetToClientPacket {
+            data: b"test-1".to_vec(),
+            sequence_number: sequence_number_1,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_2 = TargetToClientPacket {
+            data: b"test-2".to_vec(),
+            sequence_number: sequence_number_2,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_3 = TargetToClientPacket {
+            data: b"test-3".to_vec(),
+            sequence_number: sequence_number_3,
+            connection_id: connection_id.clone(),
+        };
+
+        let packet_4 = TargetToClientPacket {
+            data: b"test-4".to_vec(),
+            sequence_number: sequence_number_4,
+            connection_id: connection_id.clone(),
+        };
+
+        let result = packet_receiver.process(packet_4);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 0xff);
+        assert_eq!(packet_receiver.last_sequence_number, 0xff);
+
+        let result = packet_receiver.process(packet_3);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 0xff);
+        assert_eq!(packet_receiver.last_sequence_number, 0xff);
+
+        let result = packet_receiver.process(packet_2);
+        assert!(result.is_none());
+        assert_eq!(packet_receiver.next_sequence_number, 0xff);
+        assert_eq!(packet_receiver.last_sequence_number, 0xff);
+
+        let result = packet_receiver.process(packet_1);
+        assert!(result.is_some());
+
+        let packets = result.unwrap();
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].sequence_number, 0xff);
+        assert_eq!(packets[1].sequence_number, 0x00);
+        assert_eq!(packets[2].sequence_number, 0x01);
+
+        packet_receiver.processed(vec![
+            sequence_number_1,
+            sequence_number_2,
+            sequence_number_3,
+            sequence_number_4,
+        ]);
+
+        assert!(packet_receiver.get(sequence_number_1).is_none());
+        assert!(packet_receiver.get(sequence_number_2).is_none());
+        assert!(packet_receiver.get(sequence_number_3).is_none());
+        assert!(packet_receiver.get(sequence_number_4).is_none());
+    }
+
+    #[test]
+    fn test_in_window_no_wrap() {
+        // Window: [10, 15), seq_num 12 is in the window
+        assert!(PacketReceiver::seq_num_in_window(12, 10, 5));
+
+        // Window: [10, 15), seq_num 15 is out of the window
+        assert!(!PacketReceiver::seq_num_in_window(15, 10, 5));
+    }
+
+    #[test]
+    fn test_at_window_edges() {
+        // Window: [10, 15), seq_num 10 is in the window (window start)
+        assert!(PacketReceiver::seq_num_in_window(10, 10, 5));
+
+        // Window: [10, 15), seq_num 14 is in the window (window end - 1)
+        assert!(PacketReceiver::seq_num_in_window(14, 10, 5));
+
+        // Window: [10, 15), seq_num 15 is out of the window (right after window end)
+        assert!(!PacketReceiver::seq_num_in_window(15, 10, 5));
+    }
+
+    #[test]
+    fn test_window_with_wrap() {
+        // Window: [250, 5), seq_num 251 is in the window
+        assert!(PacketReceiver::seq_num_in_window(251, 250, 10));
+
+        // Window: [250, 5), seq_num 3 is in the window (after wrapping)
+        assert!(PacketReceiver::seq_num_in_window(3, 250, 10));
+
+        // Window: [250, 5), seq_num 5 is out of the window (window end)
+        assert!(!PacketReceiver::seq_num_in_window(5, 250, 10));
+    }
+
+    #[test]
+    fn test_outside_window_no_wrap() {
+        // Window: [50, 55), seq_num 49 is out of the window (before window start)
+        assert!(!PacketReceiver::seq_num_in_window(49, 50, 5));
+
+        // Window: [50, 55), seq_num 56 is out of the window (after window end)
+        assert!(!PacketReceiver::seq_num_in_window(56, 50, 5));
+    }
+
+    #[test]
+    fn test_outside_window_with_wrap() {
+        // Window: [250, 5), seq_num 6 is out of the window (just after window end)
+        assert!(!PacketReceiver::seq_num_in_window(6, 250, 10));
+
+        // Window: [250, 5), seq_num 249 is out of the window (just before window start)
+        assert!(!PacketReceiver::seq_num_in_window(249, 250, 10));
     }
 }

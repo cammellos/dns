@@ -15,3 +15,4 @@ pub const NETWORK_ADDRESS_TYPE_IPV6: u8 = 0x02;
 pub const NETWORK_ADDRESS_TYPE_DOMAIN_NAME: u8 = 0x03;
 pub const DNS_HEADER_ACK_BYTE: usize = 2;
 pub const DNS_HEADER_ACK_BIT: u8 = 0x01;
+pub const DEFAULT_WINDOW_SIZE: u8 = 6;
