@@ -524,7 +524,7 @@ mod test {
 
     use crate::constants::DEFAULT_WINDOW_SIZE;
     use crate::dns_parser::{extract_dns_payload_from_answer, is_ack, wrap_query, ConnectionInfo};
-    use crate::network_packet::NetworkPacket;
+    use crate::protocol::network_packet::NetworkPacket;
     use crate::udp_server::{
         src_and_transaction_id_to_string, Command, Connection, ConnectionHandler,
         ConnectionManager, ConnectionParams, PacketReceiver, TargetToClientPacket, UdpServer,
