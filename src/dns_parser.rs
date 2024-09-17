@@ -5,6 +5,8 @@ use crate::constants::{
     NETWORK_ADDRESS_TYPE_IPV6,
 };
 use crate::errors::not_implemented;
+use crate::protocol::errors::ExtractStartConnectionHeaderError;
+
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
@@ -12,25 +14,6 @@ use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-
-#[derive(Debug)]
-pub enum ExtractStartConnectionHeaderError {
-    InvalidAddressType(u8),
-    InvalidConnectionHeader,
-}
-
-impl std::fmt::Display for ExtractStartConnectionHeaderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            ExtractStartConnectionHeaderError::InvalidAddressType(at) => {
-                write!(f, "invalid address type: {}", at)
-            }
-            ExtractStartConnectionHeaderError::InvalidConnectionHeader => {
-                write!(f, "invalid connection header")
-            }
-        }
-    }
-}
 
 pub struct ParsedData {
     pub transaction_id: u8,
@@ -130,8 +113,6 @@ pub fn wrap_query(transaction_id: u8, sequence_number: u8, query_data: &[u8]) ->
 
     query
 }
-
-impl std::error::Error for ExtractStartConnectionHeaderError {}
 
 pub fn extract_dns_payload_from_answer(buf: &[u8]) -> Option<ParsedData> {
     let transaction_id = buf[0];

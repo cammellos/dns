@@ -2,6 +2,7 @@ mod constants;
 mod dns_parser;
 mod errors;
 mod network_packet;
+mod protocol;
 mod udp_server;
 mod utils;
 
