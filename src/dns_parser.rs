@@ -426,15 +426,11 @@ impl ConnectionHeader {
     }
 }
 
-pub fn is_ack(data: &[u8]) -> bool {
-    return data[DNS_HEADER_ACK_BYTE] & DNS_HEADER_ACK_BIT == 0x01;
-}
-
 #[cfg(test)]
 mod tests {
 
     use super::*;
-    use crate::utils::build_dns_query;
+    use crate::protocol::utils::build_dns_query;
     use test_log::test;
 
     #[test]
@@ -1045,14 +1041,5 @@ mod tests {
         // Check additional record count (0x0000)
         assert_eq!(response[10], 0x00);
         assert_eq!(response[11], 0x00);
-    }
-
-    #[test]
-    fn test_is_ack() {
-        let non_ack = [0x1, 0x2, 0x0, 0x4];
-        assert!(!is_ack(&non_ack));
-
-        let ack = [0x1, 0x2, 0x1, 0x4];
-        assert!(is_ack(&ack));
     }
 }

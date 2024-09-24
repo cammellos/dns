@@ -1,4 +1,4 @@
-use crate::constants::MAX_DNS_PACKET_SIZE;
+use crate::constants::{DNS_HEADER_ACK_BIT, DNS_HEADER_ACK_BYTE, MAX_DNS_PACKET_SIZE};
 
 fn domain_to_qname(domain: &str, buffer: &mut [u8], offset: &mut usize) {
     for part in domain.split('.') {
@@ -10,6 +10,10 @@ fn domain_to_qname(domain: &str, buffer: &mut [u8], offset: &mut usize) {
     }
     buffer[*offset] = 0; // Null terminator for the QNAME
     *offset += 1;
+}
+
+pub fn is_ack(data: &[u8]) -> bool {
+    return data[DNS_HEADER_ACK_BYTE] & DNS_HEADER_ACK_BIT == 0x01;
 }
 
 pub fn wrap_data_in_dns_queries(data: Vec<u8>) -> [u8; MAX_DNS_PACKET_SIZE] {
@@ -68,4 +72,18 @@ pub fn build_dns_query(domains: &[&str]) -> [u8; MAX_DNS_PACKET_SIZE] {
     }
 
     buffer
+}
+
+#[cfg(test)]
+mod test {
+    use crate::protocol::utils::is_ack;
+
+    #[test]
+    fn test_is_ack() {
+        let non_ack = [0x1, 0x2, 0x0, 0x4];
+        assert!(!is_ack(&non_ack));
+
+        let ack = [0x1, 0x2, 0x1, 0x4];
+        assert!(is_ack(&ack));
+    }
 }

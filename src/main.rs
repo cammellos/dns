@@ -4,7 +4,8 @@ mod errors;
 mod network_packet;
 mod protocol;
 mod udp_server;
-mod utils;
+
+use crate::protocol::utils;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

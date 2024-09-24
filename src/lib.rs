@@ -4,4 +4,3 @@ pub mod errors;
 pub mod network_packet;
 pub mod protocol;
 pub mod udp_server;
-pub mod utils;
